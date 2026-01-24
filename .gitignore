@@ -1,0 +1,31 @@
+# Python Runtime Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Local Environment & Secrets
+backend/venv/
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Database Integrity (Exclude temporary/locked states, include .db)
+backend/database/*.db-journal
+backend/database/*.db-shm
+backend/database/*.db-wal
+
+# IDE & Editor Specifics
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Frontend Artifacts (If applicable)
+node_modules/
+dist/
+.vite/
