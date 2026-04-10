@@ -13,10 +13,12 @@ env/
 venv/
 ENV/
 
-# Database Integrity (Exclude temporary/locked states, include .db)
+# Database files (contain runtime data and potentially stored secrets)
+backend/database/*.db
 backend/database/*.db-journal
 backend/database/*.db-shm
 backend/database/*.db-wal
+backend/*.db
 
 # IDE & Editor Specifics
 .vscode/
@@ -29,3 +31,14 @@ backend/database/*.db-wal
 node_modules/
 dist/
 .vite/
+
+# Large ML Models
+backend/models/
+
+# Build Output
+backend/static/built/
+backend/logs/
+
+# Build/temp files
+*.building
+stop_signal.txt

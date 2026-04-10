@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "entrypoint": {
+      "type": "string",
+      "pattern": "\\.py$"
+    },
+    "ui_link": {
+      "type": "string"
+    },
+    "language": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["uninitialized", "registered", "active", "failed"]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "required": ["name", "description", "version", "entrypoint", "ui_link", "language", "status"]
+}

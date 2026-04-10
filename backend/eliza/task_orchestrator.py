@@ -1,12 +1,19 @@
-from eliza_core import ElizaCore
+from core.eliza_logic import ElizaCore
 import sys
 import os
 
-# Add parent directory to sys.path to import from root
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+# Add parent directory and backend root to sys.path to import from core/root
+current_dir = os.path.dirname(os.path.abspath(__file__))
+backend_root = os.path.abspath(os.path.join(current_dir, ".."))
+project_root = os.path.abspath(os.path.join(backend_root, ".."))
+
+if backend_root not in sys.path:
+    sys.path.append(backend_root)
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
 from persona_pipeline import run_persona_pipeline
-from ..models import PipelineRequest
+from task_models import PipelineRequest
 from persona import Persona
 
 class TaskOrchestrator:

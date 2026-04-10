@@ -1,8 +1,10 @@
 from fastapi import APIRouter
-from personas.factory import PERSONA_REGISTRY
+from persona_manager import persona_manager
 
 router = APIRouter()
 
 @router.get("/personas")
 async def list_personas():
-    return {"personas": list(PERSONA_REGISTRY.keys())}
+    if not persona_manager.initialized:
+        persona_manager.load_personas()
+    return {"personas": list(persona_manager.registry.keys())}

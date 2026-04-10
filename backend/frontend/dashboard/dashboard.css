@@ -1,0 +1,156 @@
+:root {
+    --bg-main: #0a0a0c;
+    --bg-side: #111114;
+    --bg-card: #16161a;
+    --accent: #00f2ff;
+    --accent-dim: rgba(0, 242, 255, 0.1);
+    --text: #f0f0f5;
+    --text-dim: #a0a0aa;
+    --border: #222228;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    background: var(--bg-main);
+    color: var(--text);
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.main-header {
+    height: 64px;
+    background: var(--bg-side);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 24px;
+    z-index: 10;
+}
+
+.header-left { display: flex; align-items: center; gap: 24px; }
+
+h1 { font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 2px; color: var(--accent); }
+
+#btn-chat {
+    background: transparent;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 8px 16px;
+    font-weight: 600;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+#btn-chat:hover { background: var(--accent-dim); }
+
+.status-indicator { font-size: 12px; font-weight: 500; font-family: monospace; }
+
+.container { display: flex; flex: 1; overflow: hidden; }
+
+.sidebar {
+    width: 260px;
+    background: var(--bg-side);
+    border-right: 1px solid var(--border);
+    padding: 24px 0;
+}
+
+.sidebar ul { list-style: none; }
+
+.sidebar li {
+    padding: 12px 24px;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+
+.sidebar li:hover { background: var(--border); color: var(--text); }
+
+.sidebar li.active { color: var(--accent); border-right: 2px solid var(--accent); background: var(--accent-dim); }
+
+.content { flex: 1; padding: 32px; overflow-y: auto; }
+
+h2 { font-size: 24px; margin-bottom: 24px; font-weight: 600; }
+
+.card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 20px;
+}
+
+.card {
+    background: var(--bg-card);
+    padding: 24px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+}
+
+.card h3 { font-size: 12px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 8px; }
+
+.card p { font-size: 18px; font-weight: 600; font-family: monospace; color: var(--accent); }
+
+.list-container { background: var(--bg-card); border-radius: 12px; border: 1px solid var(--border); padding: 8px; }
+
+.list-item { padding: 12px 16px; border-bottom: 1px solid var(--border); font-family: monospace; }
+
+.list-item:last-child { border-bottom: none; }
+
+table { width: 100%; border-collapse: collapse; background: var(--bg-card); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
+
+th, td { padding: 16px; text-align: left; font-size: 14px; }
+
+th { background: rgba(255,255,255,0.05); color: var(--text-dim); font-weight: 500; }
+
+td { border-top: 1px solid var(--border); font-family: monospace; }
+
+.log-viewer {
+    background: #000;
+    color: #10b981;
+    font-family: monospace;
+    padding: 16px;
+    height: 500px;
+    border-radius: 8px;
+    overflow-y: scroll;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+.console-box { background: var(--bg-card); padding: 24px; border-radius: 12px; border: 1px solid var(--border); }
+
+.form-group { margin-bottom: 20px; }
+
+.form-group label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
+
+.form-group input, .form-group select, .form-group textarea {
+    width: 100%;
+    background: var(--bg-main);
+    border: 1px solid var(--border);
+    color: #fff;
+    padding: 12px;
+    border-radius: 6px;
+    font-family: inherit;
+}
+
+.form-group textarea { height: 120px; font-family: monospace; }
+
+button#btn-execute {
+    background: var(--accent);
+    color: #000;
+    border: none;
+    padding: 12px 24px;
+    font-weight: 700;
+    border-radius: 6px;
+    cursor: pointer;
+    width: 100%;
+}
+
+.response-box { margin-top: 24px; }
+
+.response-box pre { background: #000; padding: 16px; border-radius: 8px; font-size: 13px; color: #fff; overflow-x: auto; }

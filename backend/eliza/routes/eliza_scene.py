@@ -38,6 +38,6 @@ def handle_scene():
     
     return jsonify({
         "status": "ok",
-        "eliza_response": eliza_output["response"],
+        "eliza_response": eliza_output.get("reasoning", eliza_output.get("intent", "ok")),
         "scene": scene_data
     })

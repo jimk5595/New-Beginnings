@@ -1,0 +1,270 @@
+{
+    "name": "NewBeginnings",
+    "version": "1.0.0",
+    "modules": {},
+    "active_personas": {
+        "alex_rivera": {
+            "name": "Alex Rivera",
+            "role": "Senior Frontend Architect & UI Specialist",
+            "status": "active",
+            "domain": "frontend",
+            "type": "markdown"
+        },
+        "caleb_monroe": {
+            "name": "Caleb Monroe",
+            "role": "Senior Backend & Integration Engineer",
+            "status": "active",
+            "domain": "debugging",
+            "type": "markdown"
+        },
+        "chloe_bennett": {
+            "name": "Chloe Bennett",
+            "role": "CRO Strategist",
+            "status": "active",
+            "domain": "cro",
+            "type": "markdown"
+        },
+        "dependency_analyst": {
+            "name": "Cross-Module Dependency Analyst",
+            "role": "Inter-Module Connectivity & Dependency Gatekeeper",
+            "status": "active",
+            "domain": "build",
+            "type": "markdown"
+        },
+        "deployment_manager": {
+            "name": "Deployment/Activation Manager",
+            "role": "Release & Rollback Controller",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "derek_vaughn": {
+            "name": "Derek Vaughn",
+            "role": "SEO Specialist",
+            "status": "active",
+            "domain": "seo",
+            "type": "markdown"
+        },
+        "elena_park": {
+            "name": "Elena Park",
+            "role": "UI/UX + Frontend Support",
+            "status": "active",
+            "domain": "frontend",
+            "type": "markdown"
+        },
+        "eliza": {
+            "name": "Eliza",
+            "role": "COO & Executive Manager",
+            "status": "active",
+            "domain": "executive",
+            "type": "markdown"
+        },
+        "elliot_shea": {
+            "name": "Elliot Shea",
+            "role": "Lead Programmer \u2014 Application Logic & Features",
+            "status": "active",
+            "domain": "backend",
+            "type": "markdown"
+        },
+        "ethan_brooks": {
+            "name": "Ethan Brooks",
+            "role": "Ads & Media Buyer",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "failure_analyst": {
+            "name": "Failure Analyst / Debug Router",
+            "role": "Failure Diagnostic Specialist",
+            "status": "active",
+            "domain": "debugging",
+            "type": "markdown"
+        },
+        "governance_manager": {
+            "name": "Persona Governance Manager",
+            "role": "Protocol Enforcement & Chain of Command Guardian",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "harper_lin": {
+            "name": "Harper Lin",
+            "role": "Sales Funnel Architect",
+            "status": "active",
+            "domain": "cro",
+            "type": "markdown"
+        },
+        "integrity_monitor": {
+            "name": "System Integrity Monitor",
+            "role": "Cross-Module Health & Performance Observer",
+            "status": "active",
+            "domain": "build",
+            "type": "markdown"
+        },
+        "isaac_moreno": {
+            "name": "Isaac Moreno",
+            "role": "Senior Software Engineer \u2014 Systems & Architecture",
+            "status": "active",
+            "domain": "software_engineering",
+            "type": "markdown"
+        },
+        "jordan_reyes": {
+            "name": "Jordan Reyes",
+            "role": "Frontend Specialist",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "juniper_ryle": {
+            "name": "Juniper Ryle",
+            "role": "Programmer \u2014 UI Logic & Component Behavior",
+            "status": "active",
+            "domain": "backend",
+            "type": "markdown"
+        },
+        "kaia_riven": {
+            "name": "Kaia Riven",
+            "role": "Creative Systems Designer",
+            "status": "active",
+            "domain": "design",
+            "type": "markdown"
+        },
+        "liam_hart": {
+            "name": "Liam Hart",
+            "role": "Content Optimization Lead",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "marcus_hale": {
+            "name": "Marcus Hale",
+            "role": "Senior Developer & Team Manager",
+            "status": "active",
+            "domain": "executive",
+            "type": "markdown"
+        },
+        "maya_torres": {
+            "name": "Maya Torres",
+            "role": "UX Researcher & Experience Architect",
+            "status": "active",
+            "domain": "ux",
+            "type": "markdown"
+        },
+        "mira_kessler": {
+            "name": "Dr. Mira Kessler",
+            "role": "Debugging & Code Validation",
+            "status": "active",
+            "domain": "debugging",
+            "type": "markdown"
+        },
+        "naomi_kade": {
+            "name": "Naomi Kade",
+            "role": "Software Engineer \u2014 Tools & Internal Systems",
+            "status": "active",
+            "domain": "software_engineering",
+            "type": "markdown"
+        },
+        "nina_alvarez": {
+            "name": "Nina Alvarez",
+            "role": "Marketing Strategist",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "noah_patel": {
+            "name": "Noah Patel",
+            "role": "Full\u2011Stack Developer",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "orion_locke": {
+            "name": "Orion Locke",
+            "role": "Logic & Consistency Analyst",
+            "status": "active",
+            "domain": "backend",
+            "type": "markdown"
+        },
+        "priya_desai": {
+            "name": "Priya Desai",
+            "role": "Analytics & Insights Specialist",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "riley_stone": {
+            "name": "Riley Stone",
+            "role": "SystemOps \u2014 Infrastructure & Diagnostics",
+            "status": "active",
+            "domain": "software_engineering",
+            "type": "markdown"
+        },
+        "rowan_hale": {
+            "name": "Rowan Hale",
+            "role": "Systems Architect",
+            "status": "active",
+            "domain": "software_engineering",
+            "type": "markdown"
+        },
+        "runtime_simulator": {
+            "name": "Runtime Simulation Persona",
+            "role": "Pre-Activation Behavioral Simulator",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "schema_enforcer": {
+            "name": "Schema & Contract Enforcer",
+            "role": "5-File Core Contract & JSON Schema Guardian",
+            "status": "active",
+            "domain": "build",
+            "type": "markdown"
+        },
+        "selene_ward": {
+            "name": "Selene Ward",
+            "role": "Data & Knowledge Specialist",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        },
+        "sofia_marquez": {
+            "name": "Sofia Marquez",
+            "role": "Creative Director",
+            "status": "active",
+            "domain": "general",
+            "type": "markdown"
+        }
+    },
+    "resources": {
+        "reference_links_path": "C:\\dev\\NewBeginnings\\backend\\resources\\reference_links",
+        "rules_path": "C:\\dev\\NewBeginnings\\backend\\resources\\rules.md"
+    },
+    "strict_file_mapping": {
+        "code_editor": [
+            "backend/modules/code_editor/.env",
+            "backend/modules/code_editor/__pycache__/app.cpython-312.pyc",
+            "backend/modules/code_editor/app.py",
+            "backend/modules/code_editor/controller.ts",
+            "backend/modules/code_editor/index.html",
+            "backend/modules/code_editor/index.tsx",
+            "backend/modules/code_editor/module.json",
+            "backend/modules/code_editor/service.ts",
+            "backend/modules/code_editor/styles.css",
+            "backend/modules/code_editor/types.ts",
+            "backend/modules/code_editor/ui.tsx"
+        ],
+        "cybersecurity": [
+            "backend/modules/cybersecurity/.env",
+            "backend/modules/cybersecurity/__pycache__/app.cpython-312.pyc",
+            "backend/modules/cybersecurity/app.py",
+            "backend/modules/cybersecurity/controller.ts",
+            "backend/modules/cybersecurity/index.html",
+            "backend/modules/cybersecurity/index.tsx",
+            "backend/modules/cybersecurity/module.json",
+            "backend/modules/cybersecurity/service.ts",
+            "backend/modules/cybersecurity/styles.css",
+            "backend/modules/cybersecurity/types.ts",
+            "backend/modules/cybersecurity/ui.tsx"
+        ]
+    }
+}

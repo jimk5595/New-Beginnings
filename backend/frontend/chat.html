@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SYSTEM_CORE | TERMINAL_V1</title>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        background: #0d0d0d;
+        color: #d1d1d1;
+        font-family: "Consolas", monospace;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        overflow: hidden;
+      }
+      .header {
+        background: #1a1a1a;
+        padding: 10px 20px;
+        border-bottom: 2px solid #333;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-shrink: 0;
+      }
+      .header span { font-size: 13px; color: #888; }
+      .dash-link {
+        color: #d1d1d1;
+        text-decoration: none;
+        border: 1px solid #444;
+        padding: 5px 10px;
+        font-size: 12px;
+      }
+      .dash-link:hover { background: #2a2a2a; }
+      #chat-box {
+        flex: 1;
+        padding: 16px 20px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-height: 0;
+      }
+      #chat-box::before {
+        content: '';
+        flex: 1 1 auto;
+      }
+      .msg-wrap { display: flex; flex-direction: column; }
+      .msg-wrap.user { align-items: flex-end; }
+      .msg-wrap.system { align-items: center; }
+      .msg-meta { font-size: 10px; color: #555; margin-bottom: 3px; }
+      .msg-bubble {
+        max-width: 78%;
+        padding: 10px 14px;
+        border-radius: 10px;
+        line-height: 1.5;
+        font-size: 13px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .msg-wrap.user .msg-bubble { background: #1e3a5f; color: #cce4ff; }
+      .msg-wrap.persona .msg-bubble { background: #1a1a2e; color: #d1d1d1; border: 1px solid #333; }
+      .msg-wrap.system .msg-bubble { background: transparent; color: #555; font-size: 11px; font-style: italic; }
+      .attachment-preview { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+      .attachment-preview img, .attachment-preview video {
+        max-width: 220px; max-height: 160px; border-radius: 6px; border: 1px solid #333;
+      }
+      .attachment-chip {
+        background: #1e1e1e; border: 1px solid #444; border-radius: 4px;
+        padding: 3px 8px; font-size: 11px; color: #888;
+      }
+      .input-area {
+        background: #141414;
+        border-top: 2px solid #2a2a2a;
+        padding: 10px 14px;
+        flex-shrink: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .input-row { display: flex; gap: 8px; align-items: center; }
+      select {
+        background: #1a1a1a; border: 1px solid #444; color: #00d4ff;
+        padding: 8px 10px; outline: none; font-family: inherit; font-size: 12px; flex-shrink: 0;
+      }
+      #user-input {
+        flex: 1; background: #1a1a1a; border: 1px solid #444; color: #fff;
+        padding: 9px 12px; outline: none; font-family: inherit; font-size: 13px; border-radius: 4px;
+      }
+      #user-input:focus { border-color: #555; }
+      .btn {
+        background: #2a2a2a; color: #fff; border: 1px solid #444;
+        padding: 8px 16px; cursor: pointer; font-family: inherit;
+        font-size: 12px; border-radius: 4px; flex-shrink: 0;
+      }
+      .btn:hover { background: #333; }
+      .btn-attach { font-size: 16px; padding: 8px 11px; }
+      #file-input { display: none; }
+      #staging-area {
+        display: none; flex-wrap: wrap; gap: 6px; padding: 4px 0;
+      }
+      .staged-chip {
+        display: flex; align-items: center; gap: 5px;
+        background: #1e1e1e; border: 1px solid #444; border-radius: 4px;
+        padding: 3px 8px; font-size: 11px; color: #aaa;
+        max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .staged-chip .remove-btn { cursor: pointer; color: #666; font-size: 12px; flex-shrink: 0; }
+      .staged-chip .remove-btn:hover { color: #ff6b6b; }
+      .thinking { color: #555; font-size: 12px; font-style: italic; padding: 4px 0; }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <span>SYSTEM_CORE // TERMINAL_V1</span>
+      <a href="/index.html" class="dash-link">ACCESS DASHBOARD</a>
+    </div>
+
+    <div id="chat-box"></div>
+
+    <div class="input-area">
+      <div id="staging-area"></div>
+      <div class="input-row" style="margin-bottom:4px;">
+        <input type="text" id="user-name-input" placeholder="Your name (e.g. Jim)" style="width:120px;flex-shrink:0;background:#1a1a1a;border:1px solid #444;color:#aaa;padding:8px 10px;outline:none;font-family:inherit;font-size:12px;border-radius:4px;" />
+        <select id="persona-select">
+          <option value="eliza">Eliza (Manager)</option>
+          <option value="elliot_shea">Elliot Shea (Logic)</option>
+          <option value="isaac_moreno">Isaac Moreno (Backend)</option>
+          <option value="juniper_ryle">Juniper Ryle (UI)</option>
+          <option value="naomi_kade">Naomi Kade (Tools)</option>
+          <option value="mira_kessler">Dr. Mira Kessler (Debug)</option>
+          <option value="marcus_hale">Marcus Hale (Lead)</option>
+        </select>
+        <button class="btn btn-attach" onclick="document.getElementById('file-input').click()" title="Attach files">📎</button>
+        <input type="file" id="file-input" multiple onchange="stageFiles(this.files)" />
+        <input type="text" id="user-input" placeholder="Type message..." onkeydown="if(event.key==='Enter'&&!event.shiftKey)sendMessage()" />
+        <button class="btn" onclick="sendMessage()">EXECUTE</button>
+      </div>
+    </div>
+
+    <script>
+      const TEXT_MIMES = new Set([
+        'application/json','application/xml','application/javascript',
+        'application/x-python','application/x-sh','application/x-yaml',
+        'application/toml','application/csv'
+      ]);
+      function isTextMime(mime) { return mime.startsWith('text/') || TEXT_MIMES.has(mime); }
+
+      const SESSION_ID = 'session_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+      let stagedFiles = [];
+
+      // Restore saved user name from localStorage
+      const _savedName = localStorage.getItem('eliza_user_name') || '';
+      if (_savedName) document.getElementById('user-name-input').value = _savedName;
+      document.getElementById('user-name-input').addEventListener('change', function() {
+        localStorage.setItem('eliza_user_name', this.value.trim());
+      });
+
+      function stageFiles(fileList) {
+        Array.from(fileList).forEach(f => stagedFiles.push(f));
+        renderStaging();
+        document.getElementById('file-input').value = '';
+      }
+
+      function renderStaging() {
+        const area = document.getElementById('staging-area');
+        area.style.display = stagedFiles.length ? 'flex' : 'none';
+        area.innerHTML = '';
+        stagedFiles.forEach((f, i) => {
+          const chip = document.createElement('div');
+          chip.className = 'staged-chip';
+          chip.title = f.name;
+          chip.innerHTML = `📄 ${f.name} <span class="remove-btn" onclick="removeStaged(${i})">✕</span>`;
+          area.appendChild(chip);
+        });
+      }
+
+      function removeStaged(i) { stagedFiles.splice(i, 1); renderStaging(); }
+
+      async function readFileAsAttachment(file) {
+        return new Promise((resolve) => {
+          const mime = file.type || 'application/octet-stream';
+          if (isTextMime(mime)) {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve({ name: file.name, mimeType: mime, data: reader.result, isText: true });
+            reader.readAsText(file);
+          } else {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const b64 = reader.result.split(',')[1] || reader.result;
+              resolve({ name: file.name, mimeType: mime, data: b64, isText: false });
+            };
+            reader.readAsDataURL(file);
+          }
+        });
+      }
+
+      function appendMsg(role, text, attachments) {
+        const box = document.getElementById('chat-box');
+        const wrap = document.createElement('div');
+        wrap.className = `msg-wrap ${role}`;
+        const meta = document.createElement('div');
+        meta.className = 'msg-meta';
+        const sel = document.getElementById('persona-select');
+        meta.textContent = role === 'user' ? 'YOU' : (role === 'system' ? '' : sel.options[sel.selectedIndex].text.toUpperCase());
+        const bubble = document.createElement('div');
+        bubble.className = 'msg-bubble';
+        bubble.textContent = text;
+        if (role !== 'system') wrap.appendChild(meta);
+        wrap.appendChild(bubble);
+        if (attachments && attachments.length) {
+          const prev = document.createElement('div');
+          prev.className = 'attachment-preview';
+          attachments.forEach(att => {
+            if (att.mimeType && att.mimeType.startsWith('image/') && !att.isText) {
+              const img = document.createElement('img');
+              img.src = `data:${att.mimeType};base64,${att.data}`;
+              prev.appendChild(img);
+            } else if (att.mimeType && att.mimeType.startsWith('video/') && !att.isText) {
+              const vid = document.createElement('video');
+              vid.src = `data:${att.mimeType};base64,${att.data}`;
+              vid.controls = true;
+              prev.appendChild(vid);
+            } else {
+              const chip = document.createElement('span');
+              chip.className = 'attachment-chip';
+              chip.textContent = `📄 ${att.name}`;
+              prev.appendChild(chip);
+            }
+          });
+          wrap.appendChild(prev);
+        }
+        box.appendChild(wrap);
+        box.scrollTop = box.scrollHeight;
+      }
+
+      function appendThinking() {
+        const box = document.getElementById('chat-box');
+        const el = document.createElement('div');
+        el.className = 'thinking';
+        const sel = document.getElementById('persona-select');
+        el.textContent = sel.options[sel.selectedIndex].text + ' is thinking…';
+        box.appendChild(el);
+        box.scrollTop = box.scrollHeight;
+        return el;
+      }
+
+      async function sendMessage() {
+        const input = document.getElementById('user-input');
+        const text = input.value.trim();
+        if (!text && stagedFiles.length === 0) return;
+        const persona = document.getElementById('persona-select').value;
+        const user_name = document.getElementById('user-name-input').value.trim() || 'default';
+        if (user_name !== 'default') localStorage.setItem('eliza_user_name', user_name);
+        const filesToSend = [...stagedFiles];
+        stagedFiles = [];
+        renderStaging();
+        input.value = '';
+        const attachments = await Promise.all(filesToSend.map(readFileAsAttachment));
+        appendMsg('user', text || '(attachment only)', attachments);
+        const thinking = appendThinking();
+        try {
+          const res = await fetch('http://localhost:8000/api/chat/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ persona, message: text, attachments, session_id: SESSION_ID, user_name })
+          });
+          const data = await res.json();
+          thinking.remove();
+          const reply = (data.response && typeof data.response === 'object')
+            ? (data.response.text || JSON.stringify(data.response))
+            : (data.response || data.message || 'No response.');
+          appendMsg('persona', reply);
+        } catch (err) {
+          thinking.remove();
+          appendMsg('system', '[SYSTEM_ERROR]: ' + err.message);
+        }
+      }
+
+      appendMsg('system', 'System ready. Select a persona, type a message, or attach files with 📎');
+
+      function connectNotificationStream() {
+        const es = new EventSource(`http://localhost:8000/api/eliza/stream?session_id=${SESSION_ID}`);
+        es.onmessage = function(e) {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg && msg.text) appendMsg('persona', msg.text);
+          } catch (_) {}
+        };
+        es.onerror = function() {
+          es.close();
+          setTimeout(connectNotificationStream, 5000);
+        };
+      }
+      connectNotificationStream();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,36 @@
+{
+  "name": "Apprenticeship Pack v1.0",
+  "version": "1.0.0",
+  "patterns": {
+    "file_structure": {
+      "contract": "5-FILE CORE CONTRACT",
+      "files": ["module.json", "app.py", ".env", "index.html", "index.tsx"],
+      "flexibility": "Subdirectories ALLOWED"
+    },
+    "ui_excellence": {
+      "theme": "High-Fidelity Glassmorphism",
+      "icons": "Lucide-React",
+      "charts": "Recharts",
+      "styling": "Tailwind CSS via CDN — index.html MUST include <script src=\"https://cdn.tailwindcss.com\"></script> in <head>. Never rely on PostCSS or npm Tailwind builds.",
+      "mandatory_components": ["Floating Chat Bubble", "Return to Dashboard Link"],
+      "css_mandate": "ALL modules MUST be fully styled with Tailwind CSS utility classes. Unstyled or skeleton UIs are REJECTED. The Tailwind CDN script must always be present in index.html so classes resolve at runtime without a build step."
+    },
+    "backend_standard": {
+      "framework": "FastAPI",
+      "routing": "APIRouter",
+      "registration": "def register() -> {router: APIRouter}"
+    },
+    "local_ai_integration": {
+      "port": 8001,
+      "endpoint": "/v1/chat/completions",
+      "models": ["qwen-7b", "qwen-14b"],
+      "patterns": ["Anomaly Detection", "Risk Scoring", "Pattern Analysis Studio"]
+    }
+  },
+  "best_practices": [
+    "Adhere to the 5-file core contract for structural integrity.",
+    "Use subdirectories for better organization when building complex features.",
+    "Ensure end-to-end functionality before marking as complete.",
+    "Log every build mistake into the self-improvement loop."
+  ]
+}

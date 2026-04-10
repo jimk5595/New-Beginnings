@@ -1,0 +1,82 @@
+WEB DEVELOPMENT — CORE RESOURCES
+--------------------------------
+MDN Web Docs (HTML, CSS, JS): https://developer.mozilla.org/
+W3C Standards (HTML, CSS, Web APIs): https://www.w3.org/TR/
+WHATWG HTML Living Standard: https://html.spec.whatwg.org/
+ECMAScript Language Spec: https://tc39.es/ecma262/
+CSS Specifications: https://www.w3.org/Style/CSS/current-work
+JavaScript Info (Deep JS Tutorials): https://javascript.info/
+React Official Docs: https://react.dev/
+Next.js Framework: https://nextjs.org/docs
+Node.js Docs: https://nodejs.org/en/docs
+TypeScript Docs: https://www.typescriptlang.org/docs/
+Vite (Modern Frontend Tooling): https://vitejs.dev/guide/
+Webpack: https://webpack.js.org/concepts/
+Babel: https://babeljs.io/docs/
+Tailwind CSS: https://tailwindcss.com/docs
+Material Design 3: https://m3.material.io/
+Fluent UI: https://developer.microsoft.com/en-us/fluentui
+Accessibility (WCAG): https://www.w3.org/WAI/standards-guidelines/wcag/
+Nielsen Norman Group (UX Best Practices): https://www.nngroup.com/articles/
+
+SOFTWARE ENGINEERING — CORE RESOURCES
+-------------------------------------
+Python Docs: https://docs.python.org/3/
+Go Language Docs: https://go.dev/doc/
+Rust Language Book: https://doc.rust-lang.org/book/
+C# Documentation: https://learn.microsoft.com/en-us/dotnet/csharp/
+Java Documentation: https://docs.oracle.com/en/java/
+API Design — OpenAPI Spec: https://swagger.io/specification/
+Microservices Patterns: https://microservices.io/
+Martin Fowler Architecture Articles: https://martinfowler.com/articles/
+Kubernetes Docs: https://kubernetes.io/docs/
+Docker Docs: https://docs.docker.com/
+GitHub REST API: https://docs.github.com/en/rest
+OWASP Top 10 (Security): https://owasp.org/www-project-top-ten/
+Postman API Testing: https://learning.postman.com/docs/
+Jest Testing Framework: https://jestjs.io/docs/getting-started
+Cypress Testing: https://docs.cypress.io/
+
+PERFORMANCE, OPTIMIZATION & BEST PRACTICES
+------------------------------------------
+Google Web Vitals: https://web.dev/vitals/
+Google Performance Guidelines: https://web.dev/fast/
+Lighthouse Scoring: https://developer.chrome.com/docs/lighthouse/overview/
+Frontend Performance Checklist: https://web.dev/fast/#optimize-your-websites-performance
+Chrome DevTools: https://developer.chrome.com/docs/devtools/
+
+UI PATTERNS & VISUALIZATION (FOR COMPLEX MODULES)
+-------------------------------------------------
+D3.js Visualization: https://d3js.org/
+Three.js (3D Graphics): https://threejs.org/docs/
+Mapbox GL JS: https://docs.mapbox.com/mapbox-gl-js/api/
+Leaflet Maps: https://leafletjs.com/reference.html
+Chart.js: https://www.chartjs.org/docs/latest/
+ECharts: https://echarts.apache.org/en/option.html
+Deck.gl (Geospatial Visualization): https://deck.gl/docs
+CesiumJS (3D Globe): https://cesium.com/learn/cesiumjs-learn/
+
+DEVOPS & PIPELINES
+-------------------
+GitHub Actions: https://docs.github.com/en/actions
+CI/CD Best Practices: https://learn.microsoft.com/en-us/devops/pipelines/
+Terraform Docs: https://developer.hashicorp.com/terraform/docs
+Ansible Docs: https://docs.ansible.com/
+Prometheus Monitoring: https://prometheus.io/docs/
+Grafana Dashboards: https://grafana.com/docs/
+
+AI & LANGUAGE MODELS (PLATFORM CORE)
+---------------------------------
+Gemini 3.1 Pro: https://ai.google.dev/models/gemini (Current Tier: High-Fidelity)
+Gemini 3.1 Flash Lite: https://ai.google.dev/models/gemini (Current Tier: Speed/Conversation)
+Gemini API Documentation: https://ai.google.dev/docs
+Qwen 7b/14b: https://github.com/QwenLM/Qwen (Local Backup)
+
+PLATFORM CONTRACT:
+- BACKEND: Python (FastAPI) ONLY. NODE.JS IS FORBIDDEN.
+- FRONTEND: React + TypeScript ONLY. PLAIN JAVASCRIPT IS FORBIDDEN.
+- STRUCTURE: Follow the 5-file core contract. Subdirectories ALLOWED.
+- COMPLEXITY: Minimum 200 lines per module.
+- SECURITY: Rule 8 (Mandatory .env and os.getenv/process.env) in effect.
+- AI MODELS: The system is powered by the Gemini 3.1 suite (Pro, Flash, Flash Lite). All personas must acknowledge and utilize these models as the primary intelligence layer.
+- COMPLEX BUILDS: Mandate "Iterative High-Fidelity Assembly" for large-scale projects (Rule 7). No single-shot generation for complex modules.
