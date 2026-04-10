@@ -2,27 +2,27 @@ from fastapi import APIRouter
 from task_models import PipelineRequest, PipelineResponse
 from core.orchestrator import unified_orchestrator
 from core.config import Config
-import sqlite3
-import os
 import time
 
 router = APIRouter()
 start_time = time.time()
 config = Config()
 
-_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "database", "system_growth.db")
-
 @router.get("/logs")
 async def get_logs():
-    if not os.path.exists(_DB_PATH):
-        return {"logs": []}
     try:
-        conn = sqlite3.connect(_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, task, timestamp FROM build_registry ORDER BY timestamp DESC LIMIT 50")
-        rows = cursor.fetchall()
-        conn.close()
-        logs = [{"id": row[0], "message": row[1], "timestamp": row[2]} for row in rows]
+        from memory_system.memory_core import MemoryEngine
+        engine = MemoryEngine()
+        rows = engine.retrieve_context("build_registry", limit=50)
+        logs = [
+            {
+                "id": row.get("id", idx),
+                "message": row.get("project_name", ""),
+                "detail": row.get("file_structure_map", ""),
+                "timestamp": str(row.get("timestamp", "")),
+            }
+            for idx, row in enumerate(rows)
+        ]
         return {"logs": logs}
     except Exception as e:
         return {"error": str(e), "logs": []}

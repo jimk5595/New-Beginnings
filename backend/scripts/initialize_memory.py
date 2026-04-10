@@ -1,26 +1,31 @@
-import sqlite3
+import sys
+import os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from memory_system.memory_core import MemoryEngine
 
 def initialize_memory():
-    conn = sqlite3.connect('system_growth.db')
-    cursor = conn.cursor()
-    
-    # Create tables
-    cursor.execute('CREATE TABLE IF NOT EXISTS lessons_learned (mistake TEXT, fix TEXT)')
-    cursor.execute('CREATE TABLE IF NOT EXISTS build_registry (project TEXT, status TEXT)')
-    cursor.execute('CREATE TABLE IF NOT EXISTS family_profiles (detail TEXT)')
-    
-    # Log entries
-    cursor.execute("INSERT INTO lessons_learned (mistake, fix) VALUES (?, ?)", 
-                   ('Consultant Drift', 'Integration of direct file-system actions and the Working and Right directive.'))
-    
-    cursor.execute("INSERT INTO build_registry (project, status) VALUES (?, ?)", 
-                   ('Core Infrastructure', 'Git linked, SQLite Memory active, and .gitignore implemented.'))
-    
-    cursor.execute("INSERT INTO family_profiles (detail) VALUES (?)", 
-                   ('This system is designed for long-term growth with the family, focusing on memory persistence and evolving intelligence.',))
-    
-    conn.commit()
-    conn.close()
+    engine = MemoryEngine()
+
+    engine.log_experience("lessons_learned", {
+        "module_name": "core",
+        "mistake": "Consultant Drift",
+        "fix": "Integration of direct file-system actions and the Working and Right directive.",
+        "status": "resolved"
+    })
+
+    engine.log_experience("build_registry", {
+        "project_name": "Core Infrastructure",
+        "map": "Git linked, PostgreSQL memory active, .gitignore implemented."
+    })
+
+    engine.log_experience("family_profiles", {
+        "relation": "system",
+        "detail": "This system is designed for long-term growth with the family, focusing on memory persistence and evolving intelligence."
+    })
+
+    print("Memory initialized successfully in PostgreSQL.")
 
 if __name__ == "__main__":
     initialize_memory()
