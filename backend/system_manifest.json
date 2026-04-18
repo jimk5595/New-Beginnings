@@ -4,7 +4,7 @@
     "modules": {
         "weather_and_planetary_intelligence": {
             "name": "weather_and_planetary_intelligence",
-            "description": "Premium multi-page application for weather, planetary, oceanic, and geohazard intelligence. Features real-time tracking, multi-model AI comparison, and cross-domain data synthesis.",
+            "description": "A premium multi-page weather and planetary intelligence system integrating global weather models, hazard tracking, ocean data, seismic events, space weather, and planetary astronomy.",
             "path": "backend/modules/weather_and_planetary_intelligence",
             "entrypoint": "app.py",
             "ui_link": "index.html",

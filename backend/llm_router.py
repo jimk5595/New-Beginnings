@@ -2349,6 +2349,12 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             narrate("Isaac Moreno", "POST-ASSEMBLY: Syntax repair succeeded — removed offending lines.")
                         except SyntaxError as _ase2:
                             narrate("Isaac Moreno", f"POST-ASSEMBLY: Syntax still broken at line {_ase2.lineno} after line removal. BuildGate will handle.")
+            # AUTO-FIX: Add timeout=15.0 to all httpx.AsyncClient() calls in app.py.
+            # Default httpx timeout is 5s — NOAA SWPC, USGS, and other government APIs frequently
+            # exceed 5s, causing silent zero/empty responses that look like bad data instead of timeouts.
+            if 'httpx.AsyncClient()' in app_base:
+                app_base = app_base.replace('httpx.AsyncClient()', 'httpx.AsyncClient(timeout=15.0)')
+                narrate("Isaac Moreno", "AUTO-FIX: Added timeout=15.0 to all httpx.AsyncClient() calls — prevents silent zero-data from slow government APIs (NOAA, USGS).")
             merged_blob["app.py"] = app_base
 
             # Apply index.tsx safety fixes to the assembled file
@@ -2393,10 +2399,28 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                 tsx_base = tsx_base.replace('window.L', 'L')
             if tsx_base != _wl_asm_before:
                 narrate("Juniper Ryle", "DOMAIN ASSEMBLY AUTO-FIX: Replaced window.L / (window as any).L references with L.")
-            # Fix: window.Recharts → Recharts (recharts is in node_modules; LLM assumes CDN window global)
-            if 'window.Recharts' in tsx_base:
-                tsx_base = tsx_base.replace('window.Recharts', 'Recharts')
-                narrate("Juniper Ryle", "DOMAIN ASSEMBLY AUTO-FIX: Replaced window.Recharts references with Recharts.")
+            # Fix: window.Recharts → named imports (recharts is in node_modules; LLM assumes CDN window global)
+            # Also fix the (window as any).Recharts IIFE conditional pattern:
+            # LLMs write: `(window as any).Recharts ? (() => { const { X } = (window as any).Recharts; return <JSX/>; })() : (<fallback text>)`
+            # This ALWAYS evaluates to the fallback because window.Recharts doesn't exist in bundled env.
+            # Fix: (1) remove destructuring-from-window lines, (2) make condition always-true, (3) strip fallback message.
+            if '(window as any).Recharts' in tsx_base or 'window.Recharts' in tsx_base:
+                # Remove lines that destructure from (window as any).Recharts
+                tsx_base = re.sub(
+                    r'[ \t]*const\s*\{[^}]+\}\s*=\s*\(window\s+as\s+any\)\.Recharts\s*;?\s*\n',
+                    '',
+                    tsx_base
+                )
+                # Replace the conditional check so IIFE always executes the true branch
+                tsx_base = re.sub(
+                    r'typeof\s+window\s*!==\s*[\'"]undefined[\'"]\s*&&\s*\(window\s+as\s+any\)\.Recharts\s*\?',
+                    'true ?',
+                    tsx_base
+                )
+                # Remove simple (window as any).Recharts and window.Recharts references
+                tsx_base = tsx_base.replace('(window as any).Recharts', 'true')
+                tsx_base = tsx_base.replace('window.Recharts', 'true')
+                narrate("Juniper Ryle", "DOMAIN ASSEMBLY AUTO-FIX: Removed (window as any).Recharts IIFE conditional — Recharts named imports used directly.")
             # AUTO-FIX: Ensure all used React hooks are included in the React import.
             # LLMs often use useMemo, useCallback, useRef, useContext etc. but forget to import them,
             # causing "useMemo is not defined" / "useCallback is not defined" runtime crashes.
@@ -4010,6 +4034,20 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     _rc_fixed = re.sub(r'\(window\s+as\s+(?:any|Window[^)]*)\)\.L\b', 'L', _rc_fixed)
                     if 'window.L' in _rc_fixed:
                         _rc_fixed = _rc_fixed.replace('window.L', 'L')
+                    # Fix: (window as any).Recharts IIFE conditional — remove destructuring from window,
+                    # make condition always-true so named recharts imports are used directly.
+                    if '(window as any).Recharts' in _rc_fixed or 'window.Recharts' in _rc_fixed:
+                        _rc_fixed = re.sub(
+                            r'[ \t]*const\s*\{[^}]+\}\s*=\s*\(window\s+as\s+any\)\.Recharts\s*;?\s*\n',
+                            '', _rc_fixed
+                        )
+                        _rc_fixed = re.sub(
+                            r'typeof\s+window\s*!==\s*[\'"]undefined[\'"]\s*&&\s*\(window\s+as\s+any\)\.Recharts\s*\?',
+                            'true ?', _rc_fixed
+                        )
+                        _rc_fixed = _rc_fixed.replace('(window as any).Recharts', 'true')
+                        _rc_fixed = _rc_fixed.replace('window.Recharts', 'true')
+                        narrate("Dr. Mira Kessler", "RENDER-FIX AUTO-FIX: Removed (window as any).Recharts IIFE conditional — named imports used directly.")
                     # Fix: missing React hooks
                     _rcf_hooks_all = ['useState','useEffect','useRef','useMemo','useCallback',
                                       'useContext','useReducer','useLayoutEffect','forwardRef','memo','createContext']
