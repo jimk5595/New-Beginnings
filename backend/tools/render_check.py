@@ -306,32 +306,42 @@ PER_VIEW_TEST_JS = r"""async () => {
 
             // ERROR BOUNDARY CRASH CHECK: detect if ErrorBoundary caught a crash in this view.
             // Check both headings AND any element with error-boundary-style text content.
-            const allHeadings = document.querySelectorAll('h1, h2, h3, h4');
+            // ERROR BOUNDARY keyword set — matches any word-order variant the LLM may use.
+            function isErrorBoundaryText(s) {
+                return s.includes('Module View Error') || s.includes('View Module Error') ||
+                       s.includes('View Render Error') || s.includes('Render Error') ||
+                       s.includes('View Error') || s.includes('Something went wrong') ||
+                       s.includes('Component Error') || s.includes('critical error') ||
+                       s.includes('application shell has safely caught');
+            }
+            const allHeadings = document.querySelectorAll('h1, h2, h3, h4, h5');
             allHeadings.forEach(h => {
                 const htext = (h.textContent || '').trim();
-                if (htext.includes('View Module Error') || htext.includes('View Render Error') ||
-                    htext.includes('View Error') || htext.includes('Something went wrong') ||
-                    htext.includes('Render Error') || htext.includes('Component Error')) {
-                    const errMsg = h.nextElementSibling ? (h.nextElementSibling.textContent || '').trim().substring(0, 120) : 'unknown';
-                    report.issues.push(`VIEW "${label}": ErrorBoundary crash detected — "${htext}: ${errMsg}". This view crashes on render.`);
+                if (isErrorBoundaryText(htext)) {
+                    // Look for the error message near the heading (sibling, parent text, or code element)
+                    const codeEl = h.closest('div')?.querySelector('code, pre, [class*="error"]');
+                    const errMsg = (codeEl?.textContent || h.nextElementSibling?.textContent || '').trim().substring(0, 150);
+                    report.issues.push(`VIEW "${label}": ErrorBoundary crash — "${errMsg || htext}". This view crashes on render and is non-functional.`);
                 }
             });
-            // Also check for runtime error text visible in the DOM (ErrorBoundary <p> tags, etc.)
-            const allLeafEls = document.querySelectorAll('p, span, div');
+            // Also check all leaf text nodes — ErrorBoundary may use <p>, <span>, or <div>
+            const allLeafEls = document.querySelectorAll('p, span, div, code, pre');
+            const seenErrors = new Set();
             allLeafEls.forEach(el => {
                 if (el.children.length > 0) return;
                 const t = (el.innerText || '').trim();
-                if (t.length > 5 && t.length < 200) {
-                    // Catch ErrorBoundary title labels in <p> tags (our injected EB uses <p> not <h*>)
-                    if (t === 'View Error' || t === 'View Render Error' || t === 'Render Error' ||
-                        t.includes('Something went wrong') || t.includes('View Module Error')) {
+                if (t.length > 5 && t.length < 300) {
+                    if (isErrorBoundaryText(t) && !seenErrors.has('boundary')) {
+                        seenErrors.add('boundary');
                         const nextSib = el.nextElementSibling;
-                        const errMsg = nextSib ? (nextSib.innerText || '').trim().substring(0, 120) : '';
-                        report.issues.push(`VIEW "${label}": ErrorBoundary crash detected — "${t}${errMsg ? ': ' + errMsg : ''}". This view crashes on render.`);
+                        const codeEl = el.closest('div')?.querySelector('code, pre');
+                        const errMsg = (codeEl?.textContent || nextSib?.innerText || '').trim().substring(0, 150);
+                        report.issues.push(`VIEW "${label}": ErrorBoundary crash — "${errMsg || t}". This view crashes on render.`);
                     }
-                    // Catch raw JS errors shown in DOM
-                    if (t.includes('is not defined') || t.includes('Cannot access') || t.includes('before initialization')) {
-                        report.issues.push(`VIEW "${label}": Runtime error visible in DOM — "${t}". Component crashed.`);
+                    // Catch raw JS runtime errors shown in DOM (e.g. "Lucide is not defined")
+                    if ((t.includes('is not defined') || t.includes('Cannot access') || t.includes('before initialization')) && !seenErrors.has(t)) {
+                        seenErrors.add(t);
+                        report.issues.push(`VIEW "${label}": Runtime JS error in DOM — "${t}". Component crashed.`);
                     }
                 }
             });

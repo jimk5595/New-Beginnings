@@ -2399,6 +2399,27 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                 tsx_base = tsx_base.replace('window.L', 'L')
             if tsx_base != _wl_asm_before:
                 narrate("Juniper Ryle", "DOMAIN ASSEMBLY AUTO-FIX: Replaced window.L / (window as any).L references with L.")
+            # Fix: Lucide.X namespace usage — LLMs import named icons but then use Lucide.X syntax.
+            # Since `Lucide` is never defined as a namespace, this crashes with "Lucide is not defined".
+            # Fix: inject `import * as Lucide from 'lucide-react'` so namespace usage resolves.
+            if re.search(r'\bLucide\.[A-Z]', tsx_base) and 'import * as Lucide' not in tsx_base:
+                _lfl = tsx_base.splitlines(keepends=True)
+                _lfi = 0
+                _lfi_ml = False
+                for _li in range(min(80, len(_lfl))):
+                    _ls = _lfl[_li].strip()
+                    if _lfi_ml:
+                        _lfi = _li + 1
+                        if re.search(r"from\s+['\"][^'\"]+['\"]\s*;?\s*$", _ls):
+                            _lfi_ml = False
+                    elif _ls.startswith(('import ', 'from ')):
+                        _lfi = _li + 1
+                        if '{' in _ls and not re.search(r"from\s+['\"][^'\"]+['\"]\s*;?\s*$", _ls):
+                            _lfi_ml = True
+                    elif _lfi > 0 and _ls and not _ls.startswith(('//', '/*', '*')):
+                        break
+                tsx_base = ''.join(_lfl[:_lfi]) + "import * as Lucide from 'lucide-react';\n" + ''.join(_lfl[_lfi:])
+                narrate("Juniper Ryle", "DOMAIN ASSEMBLY AUTO-FIX: Injected 'import * as Lucide from lucide-react' — Lucide.X namespace usage detected, prevents 'Lucide is not defined' crash.")
             # Fix: window.Recharts → named imports (recharts is in node_modules; LLM assumes CDN window global)
             # Also fix the (window as any).Recharts IIFE conditional pattern:
             # LLMs write: `(window as any).Recharts ? (() => { const { X } = (window as any).Recharts; return <JSX/>; })() : (<fallback text>)`
@@ -4034,6 +4055,25 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     _rc_fixed = re.sub(r'\(window\s+as\s+(?:any|Window[^)]*)\)\.L\b', 'L', _rc_fixed)
                     if 'window.L' in _rc_fixed:
                         _rc_fixed = _rc_fixed.replace('window.L', 'L')
+                    # Fix: Lucide.X namespace usage in render-fix output
+                    if re.search(r'\bLucide\.[A-Z]', _rc_fixed) and 'import * as Lucide' not in _rc_fixed:
+                        _rcf_lines2 = _rc_fixed.splitlines(keepends=True)
+                        _rcf_ins2 = 0
+                        _rcf_ml2 = False
+                        for _rci2 in range(min(80, len(_rcf_lines2))):
+                            _rcs2 = _rcf_lines2[_rci2].strip()
+                            if _rcf_ml2:
+                                _rcf_ins2 = _rci2 + 1
+                                if re.search(r"from\s+['\"][^'\"]+['\"]\s*;?\s*$", _rcs2):
+                                    _rcf_ml2 = False
+                            elif _rcs2.startswith(('import ', 'from ')):
+                                _rcf_ins2 = _rci2 + 1
+                                if '{' in _rcs2 and not re.search(r"from\s+['\"][^'\"]+['\"]\s*;?\s*$", _rcs2):
+                                    _rcf_ml2 = True
+                            elif _rcf_ins2 > 0 and _rcs2 and not _rcs2.startswith(('//', '/*', '*')):
+                                break
+                        _rc_fixed = ''.join(_rcf_lines2[:_rcf_ins2]) + "import * as Lucide from 'lucide-react';\n" + ''.join(_rcf_lines2[_rcf_ins2:])
+                        narrate("Dr. Mira Kessler", "RENDER-FIX AUTO-FIX: Injected 'import * as Lucide from lucide-react' — prevents 'Lucide is not defined' crash.")
                     # Fix: (window as any).Recharts IIFE conditional — remove destructuring from window,
                     # make condition always-true so named recharts imports are used directly.
                     if '(window as any).Recharts' in _rc_fixed or 'window.Recharts' in _rc_fixed:

@@ -165,6 +165,8 @@ These rules apply ONLY to the weather_and_planetary_intelligence module and are 
 
 ### FRONTEND COMPONENT RULES
 
+- CRITICAL LUCIDE IMPORT SYNTAX: Lucide icons MUST be imported as named exports and used directly — `import { Cloud, Sun, Wind } from 'lucide-react'` then `<Cloud />`. NEVER use `import * as Lucide from 'lucide-react'` and then `<Lucide.Cloud />` — this pattern will crash with "Lucide is not defined" if the namespace import is missing. If you use the namespace pattern you MUST include `import * as Lucide from 'lucide-react'` explicitly. Preferred: use named imports only.
+
 - CRITICAL RECHARTS USAGE: Recharts components MUST be used directly from the named imports declared at the top of the file (e.g., `import { LineChart, ResponsiveContainer, ... } from 'recharts'`). NEVER use `(window as any).Recharts` or `window.Recharts` to destructure components at render time — `window.Recharts` does not exist in this environment. NEVER wrap a chart in an IIFE that conditionally accesses `window.Recharts` — this ALWAYS evaluates to the fallback branch and shows "Environment missing Recharts component injection." instead of the chart. NEVER add any fallback text inside a chart container. If the named import is at the top of the file, use it — period.
 
 - CRITICAL HERO SECTION SIZE: The weather hero/current-conditions section MUST use compact padding: `padding: '1.5rem'` max vertically. The hero container max-height: `20rem` (320px). The temperature display font size MUST NOT exceed `5rem`. Remove excessive empty space — the hero should fit comfortably above the fold without scrolling on a 1080p screen.
