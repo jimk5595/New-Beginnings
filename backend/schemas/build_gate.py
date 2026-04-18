@@ -104,8 +104,20 @@ class BuildGate:
             if "@router.get('/tile/" not in blob.get("app.py", "") and '@router.get("/tile/' not in blob.get("app.py", ""):
                 errors.append("CONTRACT_ERROR: index.tsx uses a backend tile proxy URL (/api/.../tile/...) but app.py has no @router.get('/tile/...') route. Every tile proxy URL MUST have a corresponding backend route that fetches tiles with the API key from os.getenv.")
         
+        # Hardcoded API key check — flag 32-char hex keys in frontend code.
+        # EXCEPTION: OWM map tile layer URLs (tile.openweathermap.org) MUST embed the key in the
+        # client-side URL because tile requests go directly from the browser to OWM's CDN tile server.
+        # There is no practical way to proxy tile requests without serving every tile through our own
+        # server. Strip known tile URL patterns before checking so the auto-fix that injects the OWM
+        # key into tileLayer() calls doesn't cause a false-positive rejection.
         _hex32 = _re_proxy.compile(r'[a-f0-9]{32}', _re_proxy.IGNORECASE)
-        if _hex32.search(tsx_content):
+        _tsx_no_tile_keys = _re_proxy.sub(
+            r'https://tile\.openweathermap\.org/map/[^?]+\?appid=[a-f0-9]{32}',
+            'https://tile.openweathermap.org/map/LAYER/TILE_URL?appid=TILE_KEY_EXEMPT',
+            tsx_content,
+            flags=_re_proxy.IGNORECASE
+        )
+        if _hex32.search(_tsx_no_tile_keys):
             errors.append("CONTRACT_ERROR: index.tsx contains a hardcoded 32-char hex API key — NEVER embed API keys in frontend code. Use a backend proxy route for tile URLs and inject keys via os.getenv on the server side.")
 
         # TSX brace balance check — catches truncated domain components that esbuild would fail with
@@ -118,6 +130,116 @@ class BuildGate:
                 f"SYNTAX_ERROR: index.tsx has severely unbalanced braces: {_tsx_opens} open vs {_tsx_closes} close "
                 f"(net={_tsx_net}). This means at least one domain component is missing its closing `}};` — "
                 f"esbuild will fail with 'Unexpected const/function'. Regenerate the affected component."
+            )
+        elif _tsx_net < -5:
+            errors.append(
+                f"SYNTAX_ERROR: index.tsx has excess closing braces: {_tsx_opens} open vs {_tsx_closes} close "
+                f"(net={_tsx_net}). At least one domain component has too many `}};` closers — "
+                f"esbuild will fail with 'Unexpected }}'. Strip excess closing braces from the affected component."
+            )
+        if re.search(r'\};[ \t]*\};', tsx_content):
+            errors.append(
+                "SYNTAX_ERROR: index.tsx contains a same-line cascading close-brace sequence (e.g. `}};}};}};`). "
+                "This is caused by a domain component auto-closing braces that were already closed. "
+                "The assembled file will fail esbuild with 'Unexpected }}'."
+            )
+
+        # Truncated component detection — an LLM response cut off mid-JSX leaves dangling
+        # operators/keywords immediately before the next const component declaration.
+        # Pattern: a line ending with ?? / && / || / , / ( followed by }; on the next line(s)
+        # then immediately a new component (const XxxView = ...).
+        _truncation_boundary_re = re.compile(
+            r'(?:[\?\:\,\(\[\+\-]|\?\?|&&|\|\||=>|return)\s*\n(?:\s*\};\s*\n)+\s*const\s+[A-Z]',
+            re.MULTILINE
+        )
+        if _truncation_boundary_re.search(tsx_content):
+            errors.append(
+                "SYNTAX_ERROR: index.tsx contains a truncated domain component — a dangling operator "
+                "(e.g. `??`, `&&`, `,`) appears immediately before a closing `}};` and the next component. "
+                "The LLM response was cut off mid-expression. The truncated component must be regenerated."
+            )
+
+        _ul_in_block_comment = False
+        _ul_in_template = False
+        for _ul_num, _ul_line in enumerate(tsx_content.splitlines(), 1):
+            _ul_in_single = False
+            _ul_in_double = False
+            _ul_lqcol = -1
+            _ul_i = 0
+            while _ul_i < len(_ul_line):
+                _ul_ch = _ul_line[_ul_i]
+                if _ul_in_block_comment:
+                    if _ul_line[_ul_i:_ul_i + 2] == '*/':
+                        _ul_in_block_comment = False
+                        _ul_i += 2
+                    else:
+                        _ul_i += 1
+                    continue
+                if not (_ul_in_single or _ul_in_double or _ul_in_template):
+                    if _ul_line[_ul_i:_ul_i + 2] == '//':
+                        break
+                    if _ul_line[_ul_i:_ul_i + 2] == '/*':
+                        _ul_in_block_comment = True
+                        _ul_i += 2
+                        continue
+                if _ul_ch == '\\' and (_ul_in_single or _ul_in_double):
+                    _ul_i += 2
+                    continue
+                if _ul_ch == '`':
+                    _ul_in_template = not _ul_in_template
+                elif not _ul_in_template:
+                    if _ul_ch == "'" and not _ul_in_double:
+                        _ul_in_single = not _ul_in_single
+                        if _ul_in_single:
+                            _ul_lqcol = _ul_i
+                    elif _ul_ch == '"' and not _ul_in_single:
+                        _ul_in_double = not _ul_in_double
+                _ul_i += 1
+            if _ul_in_single or _ul_in_double:
+                _ul_jsx_text_apos = False
+                if _ul_in_single and _ul_lqcol >= 0:
+                    for _jxt_i in range(_ul_lqcol - 1, -1, -1):
+                        _jxt_ch = _ul_line[_jxt_i]
+                        if _jxt_ch == '>':
+                            _ul_jsx_text_apos = True
+                            break
+                        if _jxt_ch in ('{', '<', '(', '"', '='):
+                            break
+                if not _ul_jsx_text_apos:
+                    errors.append(
+                        f"SYNTAX_ERROR: index.tsx has an unterminated string literal at line {_ul_num}. "
+                        f"esbuild will fail with 'Unterminated string literal'. Fix the broken string by closing it with the matching quote."
+                    )
+                    break
+
+        _regex_open_lines = [
+            i + 1 for i, ln in enumerate(tsx_content.splitlines())
+            if re.search(r'\.\s*(?:replace|match|search|split|test|exec|filter)\s*\(\s*/[^/\n]*$', ln)
+        ]
+        if _regex_open_lines:
+            errors.append(
+                f"SYNTAX_ERROR: index.tsx has an unterminated regular expression literal at line {_regex_open_lines[0]}. "
+                f"esbuild will fail with 'Unterminated regular expression'. The regex starting with '/' is not closed on the same line. "
+                f"Join the split regex onto one line or close it properly."
+            )
+
+        _broken_named_import_re = re.compile(r'^import\s*\{[^}]*\bimport\b', re.MULTILINE)
+        if _broken_named_import_re.search(tsx_content):
+            errors.append(
+                "SYNTAX_ERROR: index.tsx has a malformed import statement — the `import` keyword appears "
+                "inside a named import list (e.g. `import { Foo, import * as L from '...'`). "
+                "This is caused by incorrect import injection inside a multiline named-import block. "
+                "esbuild will fail with 'Expected \"as\" but found \"*\"'. Fix the broken import line."
+            )
+
+        _escaped_jsx_tag_re = re.compile(r"\{['\"]<['\"]\}[A-Za-z]")
+        if _escaped_jsx_tag_re.search(tsx_content):
+            errors.append(
+                "SYNTAX_ERROR: index.tsx contains an incorrectly escaped JSX tag opener — "
+                "the pattern `{'<'}TagName` appears in a non-JSX-text context (e.g. inside render() or a function call). "
+                "This is caused by _fix_jsx_bare_operators incorrectly escaping a JSX element opening tag. "
+                "esbuild will fail with 'Expected \":\" but found \"}\"'. "
+                "Replace `{'<'}TagName` with `<TagName`."
             )
 
         # Duplicate shell element checks — these create double-rendered overlapping UI elements.
@@ -141,6 +263,92 @@ class BuildGate:
             errors.append(
                 "CONTRACT_ERROR: index.tsx contains a floating chat bubble or MessageSquare toggle button. "
                 "The build system injects the module chat automatically. Remove the React chat component to prevent a duplicate overlapping bubble."
+            )
+
+        # Map ref inside conditional render check — LLMs frequently wrap entire content sections
+        # in `{data && (...)}` while also using `useEffect(..., [])` to init the map.
+        # The empty-dep effect fires on mount when the div is still null (inside the hidden conditional),
+        # and React never re-runs it — so the map NEVER initializes. The correct pattern is a callback ref.
+        # Detect: `useEffect` with `L.map(` AND empty `[]` dep array AND a `useRef` for the same identifier.
+        _map_useeffect_empty = _re_proxy.search(
+            r'useEffect\s*\(\s*\(\s*\)\s*=>\s*\{[^}]*L\.map\s*\([^)]*\)[^}]*\}\s*,\s*\[\s*\]',
+            tsx_content,
+            _re_proxy.DOTALL
+        )
+        if _map_useeffect_empty:
+            errors.append(
+                "CONTRACT_ERROR: index.tsx initializes a Leaflet map inside useEffect(..., []) with empty deps. "
+                "If the map container div is inside any conditional render branch ({data && ...}, {!loading && ...}), "
+                "the map NEVER initializes because the empty-dep effect fires once on mount when the div is null, "
+                "and React won't re-run it. Use the CALLBACK REF pattern instead: "
+                "`const mapCallbackRef = React.useCallback((node) => { if (!node || mapInstanceRef.current) return; "
+                "mapInstanceRef.current = L.map(node, { scrollWheelZoom: false }); ... }, []);` "
+                "and attach it as `<div ref={mapCallbackRef} style={{height:'480px',width:'100%'}}></div>`. "
+                "The callback ref fires whenever the DOM element mounts — immune to conditional rendering."
+            )
+
+        # CDN Leaflet pattern check — `declare var L: any;` is a TypeScript type stub only.
+        # It provides no runtime Leaflet object, so L.map() crashes with "L is not defined".
+        # The correct pattern is always `import * as L from 'leaflet'` (npm bundle).
+        if _re_proxy.search(r'\bdeclare\s+var\s+L\s*:\s*any', tsx_content):
+            errors.append(
+                "CONTRACT_ERROR: index.tsx contains 'declare var L: any;' which is a TypeScript type declaration only "
+                "— it provides no runtime Leaflet object. Use 'import * as L from \"leaflet\";' instead. "
+                "'declare var L' causes 'L is not defined' runtime crashes because L never gets assigned a value."
+            )
+        if _re_proxy.search(r'\bwindow\.L\b', tsx_content) or _re_proxy.search(r'\(window\s+as\s+any\)\.L\b', tsx_content):
+            errors.append(
+                "CONTRACT_ERROR: index.tsx accesses Leaflet via 'window.L' or '(window as any).L'. "
+                "Leaflet is bundled via npm and NOT available as a CDN window global. "
+                "window.L is always undefined in bundled environments. Use 'import * as L from \"leaflet\";'."
+            )
+
+        # Non-ASCII characters inside JS string literals / SVG attribute values.
+        # Gemini occasionally hallucinates Unicode (Bengali, Arabic, CJK, etc.) inside URLs or
+        # JavaScript identifier contexts — this causes silent runtime failures (broken SVG, bad URLs).
+        # We scan line-by-line and flag the first line that has non-ASCII outside of a comment.
+        for _na_i, _na_ln in enumerate(tsx_content.splitlines(), 1):
+            _na_stripped = _na_ln.strip()
+            if _na_stripped.startswith("//") or _na_stripped.startswith("*"):
+                continue
+            try:
+                _na_ln.encode("ascii")
+            except UnicodeEncodeError:
+                # Allow common safe Unicode: emoji in string literals are fine; only flag if
+                # non-ASCII appears directly in what looks like a URL or attribute context.
+                if re.search(r'[^\x00-\x7F]', _na_ln) and re.search(
+                    r'(?:https?://|xmlns=|stroke|fill|viewBox|src=|href=|url\()', _na_ln
+                ):
+                    errors.append(
+                        f"SYNTAX_ERROR: index.tsx line {_na_i} contains non-ASCII characters inside a URL or "
+                        f"SVG attribute. This is a hallucinated character from the LLM that breaks the URL or "
+                        f"SVG at runtime. Remove or replace the non-ASCII characters."
+                    )
+                    break
+
+        # Duplicate route path check — FastAPI uses only the first matching route, silently ignoring the rest.
+        # Duplicates typically come from multiple domain generators writing the same endpoint path.
+        _route_paths = _re_proxy.findall(r'@router\.(?:get|post|put|delete)\(["\']([^"\']+)["\']', app_py)
+        _seen_paths = {}
+        for _rp in _route_paths:
+            if _rp in _seen_paths:
+                errors.append(
+                    f"CONTRACT_ERROR: app.py defines duplicate route path '{_rp}'. "
+                    f"FastAPI registers only the first occurrence — all others are silently ignored, "
+                    f"causing incorrect responses. Each route path must be unique."
+                )
+                break
+            _seen_paths[_rp] = True
+
+        # Weak RETURNS CONTRACT check — `# Returns: {fieldname}` with only one bare identifier
+        # gives the frontend no information about list item fields, causing field-name mismatches.
+        _weak_rc = _re_proxy.findall(r'#\s*Returns:\s*\{(\w+)\}\s*$', app_py, _re_proxy.MULTILINE)
+        if _weak_rc:
+            errors.append(
+                f"CONTRACT_ERROR: app.py has weak Returns contracts with only a bare field name "
+                f"(e.g., '# Returns: {{{_weak_rc[0]}}}'). For list fields, document the exact field names "
+                f"of each list item: '# Returns: {{items: [{{time: str, temp: float, ...}}]}}'. "
+                f"The frontend reads these names literally — vague contracts cause field-name mismatches."
             )
 
         # HTTPException-in-except check — causes blank screens when external APIs fail.
@@ -351,12 +559,6 @@ class BuildGate:
         is_valid, errors = self.validate_blob(module_name, blob, task_prompt=task_prompt)
         if not is_valid:
             narrate("Dr. Mira Kessler", f"FAILED: {'; '.join(errors)}")
-            # CLEANUP: Ensure no empty folder is left behind
-            module_path = self.project_root / "backend" / "modules" / module_name
-            if module_path.exists():
-                import shutil
-                narrate("Integrity Monitor", f"Cleaning up failed module directory: {module_name}")
-                shutil.rmtree(module_path)
             return {"success": False, "error": "Validation failed", "details": "; ".join(errors)}
 
         narrate("Dr. Mira Kessler", "SUCCESS: Module passed basic validation.")

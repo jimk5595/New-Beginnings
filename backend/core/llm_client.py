@@ -100,7 +100,26 @@ def get_client(api_version: str = "v1beta"):
         setattr(get_client, attr_name, client)
     return getattr(get_client, attr_name)
 
-async def call_llm_async(model_name: str, prompt: str, system_instruction: str = "", tools: list = None, max_tokens: int = 65536, persona_name: str = "Integrity Monitor", history: list = None, attachments: list = None, blocked_models: list = None, thinking_level: str = None) -> dict:
+
+def reset_client(api_version: str = None):
+    """Reset cached Gemini client(s) to force fresh HTTP connections on the next call.
+
+    When asyncio.wait_for() times out, the thread running the Gemini SDK call cannot
+    be cancelled — it continues as a zombie, holding the old client's connection pool
+    slots open. If the fallback model uses the same cached client, it competes for
+    those same slots and is often slow or stalled too. Resetting the client forces a
+    brand-new connection pool for the fallback, completely isolated from zombie threads.
+    """
+    if api_version:
+        attr_name = f"_client_{api_version.replace('.', '_')}"
+        if hasattr(get_client, attr_name):
+            delattr(get_client, attr_name)
+    else:
+        for attr in list(vars(get_client)):
+            if attr.startswith("_client_"):
+                delattr(get_client, attr)
+
+async def call_llm_async(model_name: str, prompt: str, system_instruction: str = "", tools: list = None, max_tokens: int = 65536, persona_name: str = "Integrity Monitor", history: list = None, attachments: list = None, blocked_models: list = None, thinking_level: str = None, disable_search: bool = False) -> dict:
     """Unified LLM entry point with version-aware routing, Tier-1 caching, and Thought Signature persistence."""
     current_date = datetime.now().strftime("%B %d, %Y")
     
@@ -160,9 +179,10 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
         if not model: continue
         narrate(persona_name, f"Attempting connection to {model}...")
         
-        # Timeout tuned for Gemini 3.1: complex builds (index.tsx, app.py) legitimately need 2-4 minutes.
-        # temperature=1.0 + ThinkingLevel already prevents infinite loops. 100s was too aggressive.
-        timeout_val = 280 if "3.1" in model else 300
+        # Timeout: 150s per model. On API-slow days 280s meant one domain could burn 9+ minutes
+        # (280s customtools timeout + 280s pro-preview timeout) before moving on.
+        # 150s is enough for any legitimate response — if a model hasn't replied in 150s, it's stuck.
+        timeout_val = 150 if "3.1" in model else 180
         max_attempts = 1 if "3.1" in model else 2
         
         for attempt in range(max_attempts):
@@ -192,7 +212,7 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
                             temperature=1.0 if (is_gemini_3 or is_25) else 0.7
                         )
                         
-                        if (is_gemini_3 or is_25) and not tools:
+                        if (is_gemini_3 or is_25) and not tools and not disable_search:
                             gen_config.tools = [types.Tool(google_search=types.GoogleSearch())]
                         
                         if is_31:
@@ -267,7 +287,8 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
                                     text_content += part.text
                                 elif hasattr(part, 'function_call') and part.function_call:
                                     narrate(persona_name, f"SUCCESS: {model} executed tool: {part.function_call.name}")
-                                    text_content += f"Tool executed: {part.function_call.name}"
+                                    if tools:
+                                        text_content += f"Tool executed: {part.function_call.name}"
                         
                         has_function_call = any(
                             hasattr(p, 'function_call') and p.function_call
@@ -299,13 +320,20 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
                             await asyncio.sleep(wait_sec)
                             last_network_error = e
                             continue
+                        if any(word in error_str for word in ["503", "UNAVAILABLE", "DEMAND", "429", "QUOTA", "LIMIT"]):
+                            wait_sec = (network_retry + 1) * 10
+                            narrate(persona_name, f"HIGH DEMAND on {model}: {str(e)}. Retrying in {wait_sec}s (Attempt {network_retry + 1}/3)...")
+                            await asyncio.sleep(wait_sec)
+                            last_network_error = e
+                            continue
                         raise e
                 
                 if last_network_error:
                     raise last_network_error
 
             except asyncio.TimeoutError:
-                narrate(persona_name, f"TIMEOUT: {model} is caught in a thinking loop (> {timeout_val}s). Failing over...")
+                narrate(persona_name, f"TIMEOUT: {model} is caught in a thinking loop (> {timeout_val}s). Resetting connection pool and failing over...")
+                reset_client()
                 break 
             except Exception as e:
                 error_str = str(e).upper()
@@ -316,7 +344,7 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
                     break 
 
                 if any(word in error_str for word in ["QUOTA", "LIMIT", "429", "503", "DEMAND"]):
-                    narrate(persona_name, f"WARNING: {model} experiencing high demand. Pivoting to fallback...")
+                    narrate(persona_name, f"WARNING: {model} still unavailable after retries. Pivoting to fallback...")
                     break 
                 
                 if attempt == 0:

@@ -44,8 +44,10 @@ def RUN_REPAIR_TASK(task_text: str, project_map: ProjectMap = None, module_dir: 
             scan_dir = Path(module_dir)
         else:
             scan_dir = root_dir / "backend" / "modules"
+        SKIP_DIRS = {"node_modules", "venv", ".git", "__pycache__", "dist", "build"}
         if scan_dir.exists():
-            for root, _, files in os.walk(scan_dir):
+            for root, dirs, files in os.walk(scan_dir):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
                 for file in files:
                     if file.endswith((".py", ".ts", ".tsx")):
                         file_path = os.path.join(root, file)

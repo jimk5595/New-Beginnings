@@ -319,32 +319,6 @@ def build_modules(target_module: str = None):
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     (BUILD_DIR / "modules").mkdir(parents=True, exist_ok=True)
 
-    # 1.5 Ensure node_modules junction for esbuild
-    shared_nm = MODULES_DIR / "node_modules"
-    source_nm = FRONTEND_DIR / "node_modules"
-    
-    if not shared_nm.exists() and source_nm.exists():
-        import subprocess as _sp
-        print(f"Attempting to create node_modules junction: {shared_nm} -> {source_nm}")
-        # On Windows, mklink /J is preferred for node_modules
-        if os.name == 'nt':
-            _mklink_result = _sp.run(
-                ['cmd', '/c', 'mklink', '/J', str(shared_nm), str(source_nm)],
-                capture_output=True, text=True
-            )
-            if _mklink_result.returncode != 0:
-                print(f"WARNING: node_modules junction failed (rc={_mklink_result.returncode}): {_mklink_result.stderr.strip()}")
-                print("Falling back to NODE_PATH for module resolution.")
-            else:
-                print(f"SUCCESS: node_modules junction created.")
-        else:
-            # On Unix, use symbolic link
-            try:
-                os.symlink(source_nm, shared_nm, target_is_directory=True)
-                print(f"SUCCESS: node_modules symlink created.")
-            except Exception as e:
-                print(f"WARNING: node_modules symlink failed: {e}")
-
     # NODE_PATH: ensures esbuild resolves react-leaflet, recharts, lucide-react, etc.
     # from the shared frontend/node_modules regardless of where esbuild is invoked from.
     node_path_env = str(FRONTEND_DIR / "node_modules")
@@ -427,6 +401,15 @@ def build_modules(target_module: str = None):
                     if result.returncode != 0:
                         print(f"    esbuild FAILED (rc={result.returncode}) for {module_folder}")
                         failed_modules.append(module_folder)
+                        # Delete stale bundle — if old index.js remains, the module validator sees
+                        # it as a "successful" build, mounts the module, and the old frontend JS
+                        # hits routes from the NEW app.py that no longer exist → 404s everywhere.
+                        if out_file.exists():
+                            try:
+                                out_file.unlink()
+                                print(f"    Deleted stale bundle to prevent mismatched frontend/backend: {out_file}")
+                            except Exception as _del_e:
+                                print(f"    WARNING: Could not delete stale bundle {out_file}: {_del_e}")
                         continue
                     elif not out_file.exists():
                         print(f"    esbuild exited 0 but {out_file} was NOT produced for {module_folder}")

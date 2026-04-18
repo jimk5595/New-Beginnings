@@ -400,7 +400,8 @@ class UnifiedOrchestrator:
                 attachments=attachments,
                 history=session_history
             )
-            history_mgr.add_message("user", text)
+            _user_hist_msg = text.rsplit("CURRENT_USER_INPUT:", 1)[-1].strip() if "CURRENT_USER_INPUT:" in text else text
+            history_mgr.add_message("user", _user_hist_msg)
             history_mgr.add_message("assistant", result_dict.get("text", ""), thought_signature=result_dict.get("thought_signature"))
             return {
                 "response": result_dict,
@@ -420,7 +421,8 @@ class UnifiedOrchestrator:
             attachments=attachments,
             history=session_history
         )
-        history_mgr.add_message("user", text)
+        _user_hist_msg = text.rsplit("CURRENT_USER_INPUT:", 1)[-1].strip() if "CURRENT_USER_INPUT:" in text else text
+        history_mgr.add_message("user", _user_hist_msg)
         assistant_text = response_dict.get("text", "")
         history_mgr.add_message("assistant", assistant_text, thought_signature=response_dict.get("thought_signature"))
 

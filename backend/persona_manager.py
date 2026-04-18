@@ -65,8 +65,14 @@ class PersonaManager:
 
         self.registry = {}
         
-        # 1. Load Markdown Personas
-        for root, dirs, files in os.walk(PERSONAS_DIR):
+        # 1. Load Markdown Personas — ROOT ONLY.
+        # Subdirectories of personas/ are MODULE-SCOPED (e.g. personas/my_module/*.md).
+        # Module-scoped personas must NOT be loaded into the system-wide registry;
+        # they are injected exclusively into their module's chat bubble by the build system.
+        # Walking subdirectories caused module personas to pollute active_personas in the manifest.
+        root = PERSONAS_DIR
+        files = [f for f in os.listdir(PERSONAS_DIR) if os.path.isfile(os.path.join(PERSONAS_DIR, f))]
+        if True:
             # Check for department registry JSON
             if "department_registry.json" in files:
                 try:
@@ -152,9 +158,10 @@ class PersonaManager:
         except ImportError:
             pass
 
-        # 2. Dynamic Discovery (New System)
-        # We look for all .py files in personas/ subdirectories and check for Persona subclasses
-        for root, dirs, files in os.walk(PERSONAS_DIR):
+        # 2. Dynamic Discovery (New System) — ROOT ONLY.
+        # Only scan the root personas/ directory, not module-scoped subdirectories.
+        _py_root_files = [f for f in os.listdir(PERSONAS_DIR) if os.path.isfile(os.path.join(PERSONAS_DIR, f))]
+        for root, dirs, files in [(PERSONAS_DIR, [], _py_root_files)]:
             for filename in files:
                 if filename.endswith(".py") and filename not in ["__init__.py", "base.py", "base_persona.py", "factory.py", "registry.py", "loader.py"]:
                     # Construct module path

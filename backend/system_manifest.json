@@ -1,7 +1,53 @@
 {
     "name": "NewBeginnings",
     "version": "1.0.0",
-    "modules": {},
+    "modules": {
+        "weather_and_planetary_intelligence": {
+            "name": "weather_and_planetary_intelligence",
+            "description": "Premium multi-page application for weather, planetary, oceanic, and geohazard intelligence. Features real-time tracking, multi-model AI comparison, and cross-domain data synthesis.",
+            "path": "backend/modules/weather_and_planetary_intelligence",
+            "entrypoint": "app.py",
+            "ui_link": "index.html",
+            "status": "active",
+            "personas": [
+                {
+                    "id": "bonnie_kensington",
+                    "name": "Bonnie Kensington",
+                    "role": "Planetary & Astronomy Analyst"
+                },
+                {
+                    "id": "dr_aeris_caldwell",
+                    "name": "Dr. Aeris Caldwell",
+                    "role": "Chief Meteorologist"
+                },
+                {
+                    "id": "dr_lena_vance",
+                    "name": "Dr. Lena Vance",
+                    "role": "Geohazard Specialist"
+                },
+                {
+                    "id": "gale_hawthorne",
+                    "name": "Gale Hawthorne",
+                    "role": "Severe Weather Specialist"
+                },
+                {
+                    "id": "julian_rourke",
+                    "name": "Julian Rourke",
+                    "role": "Space Weather Specialist"
+                },
+                {
+                    "id": "marin_kai",
+                    "name": "Marin Kai",
+                    "role": "Ocean & Marine Specialist"
+                },
+                {
+                    "id": "terra_santos",
+                    "name": "Terra Santos",
+                    "role": "Earth Systems Analyst"
+                }
+            ]
+        }
+    },
     "active_personas": {
         "alex_rivera": {
             "name": "Alex Rivera",
@@ -238,33 +284,5 @@
     "resources": {
         "reference_links_path": "C:\\dev\\NewBeginnings\\backend\\resources\\reference_links",
         "rules_path": "C:\\dev\\NewBeginnings\\backend\\resources\\rules.md"
-    },
-    "strict_file_mapping": {
-        "code_editor": [
-            "backend/modules/code_editor/.env",
-            "backend/modules/code_editor/__pycache__/app.cpython-312.pyc",
-            "backend/modules/code_editor/app.py",
-            "backend/modules/code_editor/controller.ts",
-            "backend/modules/code_editor/index.html",
-            "backend/modules/code_editor/index.tsx",
-            "backend/modules/code_editor/module.json",
-            "backend/modules/code_editor/service.ts",
-            "backend/modules/code_editor/styles.css",
-            "backend/modules/code_editor/types.ts",
-            "backend/modules/code_editor/ui.tsx"
-        ],
-        "cybersecurity": [
-            "backend/modules/cybersecurity/.env",
-            "backend/modules/cybersecurity/__pycache__/app.cpython-312.pyc",
-            "backend/modules/cybersecurity/app.py",
-            "backend/modules/cybersecurity/controller.ts",
-            "backend/modules/cybersecurity/index.html",
-            "backend/modules/cybersecurity/index.tsx",
-            "backend/modules/cybersecurity/module.json",
-            "backend/modules/cybersecurity/service.ts",
-            "backend/modules/cybersecurity/styles.css",
-            "backend/modules/cybersecurity/types.ts",
-            "backend/modules/cybersecurity/ui.tsx"
-        ]
     }
 }

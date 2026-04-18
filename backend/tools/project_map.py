@@ -176,7 +176,8 @@ class ProjectMap:
     def find_file_by_name(self, name: str) -> List[str]:
         results = []
         for p in self.root_dir.rglob(name):
-            results.append(str(p.relative_to(self.root_dir)))
+            if not self._should_skip(p):
+                results.append(str(p.relative_to(self.root_dir)))
         return results
 
     def find_ts_files_containing(self, text: str) -> List[str]:

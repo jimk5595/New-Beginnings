@@ -39,7 +39,7 @@ class RepairOrchestrator:
         missing_modules = []
         for name, info in registry.items():
             if info.get("status") == "active":
-                mod_path = self.root_dir / info.get("path", "")
+                mod_path = Path(info.get("module_path", "")) if info.get("module_path") else self.backend_dir / "modules" / name
                 if not mod_path.exists():
                     missing_modules.append(name)
         
@@ -98,12 +98,15 @@ class RepairOrchestrator:
         # Track last modified times of module files
         last_mtimes = {}
 
+        _MTIMES_SKIP_DIRS = {"node_modules", "venv", ".git", "__pycache__", "dist", "build"}
+
         def get_all_mtimes():
             mtimes = {}
             modules_path = self.backend_dir / "modules"
             if not modules_path.exists():
                 return mtimes
             for root, dirs, files in os.walk(modules_path):
+                dirs[:] = [d for d in dirs if d not in _MTIMES_SKIP_DIRS]
                 for file in files:
                     if file.endswith(('.py', '.json', '.ts', '.tsx', '.html', '.css')):
                         p = Path(root) / file
@@ -135,6 +138,10 @@ class RepairOrchestrator:
                         for f in critical_changes:
                             # Extract module name from path: .../modules/{name}/module.json
                             mod_match = os.path.basename(os.path.dirname(f))
+                            # Skip if a .building lock file exists — build is in progress
+                            _lock = self.backend_dir / "modules" / mod_match / ".building"
+                            if _lock.exists():
+                                continue
                             if mod_match in registry or os.path.exists(f):
                                 ready_to_sync.append(f)
                         
@@ -149,15 +156,18 @@ class RepairOrchestrator:
                     last_mtimes = get_all_mtimes() # Refresh after sync
 
                 # 2. Check for missing bundles (black screen detection)
-                # MONITOR ONLY: We report missing bundles but do NOT build. 
-                # Building is the job of the Personas (via Expansion Engine).
                 registry = get_registry()
                 for mod_name, info in registry.items():
                     if info.get("status") == "active":
                         built_js = self.backend_dir / "static" / "built" / "modules" / mod_name / "index.js"
                         if not built_js.exists():
-                            narrate("Integrity Monitor", f"MISSING BUNDLE DETECTED for '{mod_name}'. Integrity degraded (Black Screen).")
+                            # Skip if build is actively in progress
+                            _build_lock = self.backend_dir / "modules" / mod_name / ".building"
+                            if _build_lock.exists():
+                                continue
+                            narrate("Integrity Monitor", f"MISSING BUNDLE DETECTED for '{mod_name}'. Triggering repair...")
                             system_monitor.update_mount(mod_name, success=False, log="Missing index.js (Bundle Failure)")
+                            await self._trigger_repair_routine(mod_name, "module")
 
             except asyncio.CancelledError:
                 break
@@ -190,6 +200,17 @@ class RepairOrchestrator:
 
     async def _trigger_repair_routine(self, target: str, category: str) -> bool:
         """Automated repair routine. Identifies broken/mocked files and rewrites them via LLM."""
+        now = time.time()
+        attempts = self._repair_attempts.get(target, [0, 0])
+        if attempts[1] >= 3 and (now - attempts[0]) < 300:
+            narrate("System", f"Skipping repair for '{target}' — {attempts[1]} attempts in last 5 min (throttled).")
+            return False
+        if (now - attempts[0]) >= 300:
+            attempts = [now, 0]
+        attempts[0] = now
+        attempts[1] += 1
+        self._repair_attempts[target] = attempts
+
         narrate("System", f"Executing targeted repair for {category} '{target}'...")
         
         log_entry = {
@@ -208,11 +229,14 @@ class RepairOrchestrator:
                 from tools.project_map import ProjectMap
                 import re as _re
 
+                loop = asyncio.get_running_loop()
                 module_dir = self.backend_dir / "modules" / target
                 broken_files = []
 
+                _SKIP_DIRS = {"node_modules", "venv", ".git", "__pycache__", "dist", "build"}
                 if module_dir.exists():
-                    for root, _, files in os.walk(module_dir):
+                    for root, dirs, files in os.walk(module_dir):
+                        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
                         for file in files:
                             if file.endswith((".py", ".ts", ".tsx", ".html")):
                                 fp = Path(root) / file
@@ -225,11 +249,88 @@ class RepairOrchestrator:
                                 except Exception:
                                     pass
 
+                    tsx_path = module_dir / "index.tsx"
+                    if tsx_path.exists() and str(tsx_path.name) not in broken_files:
+                        try:
+                            tsx_content = tsx_path.read_text(encoding="utf-8", errors="ignore")
+                            _o = tsx_content.count('{')
+                            _c = tsx_content.count('}')
+                            _net = _o - _c
+                            if abs(_net) > 5:
+                                broken_files.append(f"index.tsx (brace imbalance: {_net:+d})")
+                            elif _re.search(r'\};[ \t]*\};', tsx_content):
+                                broken_files.append("index.tsx (same-line cascading close-braces '};}; ')")
+                            else:
+                                for line_num, line in enumerate(tsx_content.splitlines(), 1):
+                                    in_single = False
+                                    in_double = False
+                                    in_template = False
+                                    i = 0
+                                    while i < len(line):
+                                        ch = line[i]
+                                        if ch == '\\' and (in_single or in_double):
+                                            i += 2
+                                            continue
+                                        if ch == '`':
+                                            in_template = not in_template
+                                        elif not in_template:
+                                            if ch == "'" and not in_double:
+                                                in_single = not in_single
+                                            elif ch == '"' and not in_single:
+                                                in_double = not in_double
+                                        i += 1
+                                    if in_single or in_double:
+                                        broken_files.append(f"index.tsx (unterminated string literal at line {line_num})")
+                                        break
+                        except Exception:
+                            pass
+
+                _tsx_direct_fixed = False
+                _unterminated_entries = [f for f in broken_files if "unterminated string literal" in f]
+                if _unterminated_entries and tsx_path.exists():
+                    try:
+                        _tsx_text = tsx_path.read_text(encoding="utf-8", errors="ignore")
+                        _tsx_ls = _tsx_text.splitlines(keepends=True)
+                        _orch_fixed_count = 0
+                        for _orch_i, _orch_line in enumerate(_tsx_ls):
+                            _orch_qs = False; _orch_qd = False; _orch_qt = False
+                            _orch_lqcol = -1; _orch_lqch = None; _orch_ci = 0
+                            while _orch_ci < len(_orch_line):
+                                _orch_ch = _orch_line[_orch_ci]
+                                if _orch_ch == '\\' and (_orch_qs or _orch_qd):
+                                    _orch_ci += 2; continue
+                                if _orch_ch == '`':
+                                    _orch_qt = not _orch_qt
+                                elif not _orch_qt:
+                                    if _orch_ch == "'" and not _orch_qd:
+                                        _orch_qs = not _orch_qs
+                                        if _orch_qs: _orch_lqcol = _orch_ci; _orch_lqch = "'"
+                                    elif _orch_ch == '"' and not _orch_qs:
+                                        _orch_qd = not _orch_qd
+                                        if _orch_qd: _orch_lqcol = _orch_ci; _orch_lqch = '"'
+                                _orch_ci += 1
+                            if (_orch_qs or _orch_qd) and _orch_lqch and _orch_lqcol >= 0:
+                                _orch_stripped = _orch_line.rstrip('\r\n')
+                                _orch_has_split = bool(_re.search(r'\.split\(\s*$', _orch_stripped[:_orch_lqcol]))
+                                if _orch_has_split:
+                                    _tsx_ls[_orch_i] = _orch_stripped + _orch_lqch + ')\n'
+                                else:
+                                    _tsx_ls[_orch_i] = _orch_stripped + _orch_lqch + '\n'
+                                _orch_fixed_count += 1
+                                narrate("Alex Rivera", f"DIRECT FIX: Closed unterminated {_orch_lqch} string at line {_orch_i + 1} in index.tsx.")
+                        if _orch_fixed_count > 0:
+                            _tsx_direct_fixed = True
+                            tsx_path.write_text(''.join(_tsx_ls), encoding="utf-8")
+                            for _ue in list(_unterminated_entries):
+                                if _ue in broken_files:
+                                    broken_files.remove(_ue)
+                    except Exception as _dfe:
+                        narrate("Alex Rivera", f"Direct TSX fix failed: {_dfe}")
+
                 if broken_files:
                     narrate("Alex Rivera", f"Found {len(broken_files)} broken file(s) in '{target}': {', '.join(broken_files)}. Repairing...")
                     task_text = f"fix mock and placeholder code in module {target}: {', '.join(broken_files)}"
                     project_map = ProjectMap()
-                    loop = asyncio.get_running_loop()
                     repair_result = await loop.run_in_executor(
                         None,
                         lambda: RUN_REPAIR_TASK(task_text, project_map, module_dir=str(module_dir))
@@ -238,12 +339,19 @@ class RepairOrchestrator:
                 else:
                     narrate("Alex Rivera", f"No mock/broken patterns found in '{target}' files.")
 
-                # Step 2: Diagnostic Check - Bundle presence
+                # Step 2: Rebuild bundle via esbuild
                 built_js = self.backend_dir / "static" / "built" / "modules" / target / "index.js"
-                if not built_js.exists():
-                    narrate("Integrity Monitor", f"REPORT: Bundle missing for '{target}'. Requesting Persona rebuild if task is not active.")
-                    # MONITOR ONLY: Building is strictly a Persona responsibility.
-                    system_monitor.update_mount(target, success=False, log="Missing index.js")
+                if not built_js.exists() or broken_files:
+                    narrate("Integrity Monitor", f"Triggering esbuild rebuild for '{target}'...")
+                    try:
+                        from core.toolset import RUN_BUILD_SCRIPT
+                        build_output = await loop.run_in_executor(None, lambda: RUN_BUILD_SCRIPT(module_name=target))
+                        if "FAILED" in build_output or "ERROR" in build_output:
+                            narrate("Integrity Monitor", f"Rebuild failed for '{target}': {build_output[:300]}")
+                        else:
+                            narrate("Integrity Monitor", f"Rebuild succeeded for '{target}'.")
+                    except Exception as build_err:
+                        narrate("Integrity Monitor", f"Rebuild error for '{target}': {build_err}")
 
                 # Step 3: Re-sync registry
                 run_discovery_and_registration()
