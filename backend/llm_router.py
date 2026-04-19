@@ -3042,7 +3042,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
 
             _va_all_defined = _va_import_names | _va_defined_components
             _va_undefined = _va_used_components - _va_all_defined
-            _va_known_globals = {"Fragment", "Suspense", "ErrorBoundary", "Map", "Marker", "TileLayer",
+            _va_known_globals = {"Fragment", "Suspense", "ErrorBoundary", "Marker", "TileLayer",
                                  "Popup", "Polyline", "Circle", "CircleMarker", "GeoJSON", "LayerGroup",
                                  "LayersControl", "MapContainer", "ZoomControl", "SVG",
                                  "HTMLElement", "HTMLDivElement", "HTMLCanvasElement", "HTMLInputElement",
@@ -3052,23 +3052,25 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             _va_known_lucide = {
                 "Activity", "AlertCircle", "AlertTriangle", "Archive", "ArrowDown", "ArrowLeft",
                 "ArrowRight", "ArrowUp", "Award", "BarChart2", "BarChart3", "Battery", "BatteryCharging",
-                "Bell", "Book", "BookOpen", "Brain", "Bug", "Calendar", "Camera", "Check", "CheckCircle",
-                "ChevronDown", "ChevronLeft", "ChevronRight", "ChevronUp", "Circle", "Clock", "Cloud",
-                "CloudRain", "CloudSnow", "Code", "Compass", "Copy", "Cpu", "CreditCard", "Crosshair",
+                "Bell", "Book", "BookOpen", "Bot", "Brain", "BrainCircuit", "Bug", "Calendar", "Camera",
+                "Check", "CheckCircle", "ChevronDown", "ChevronLeft", "ChevronRight", "ChevronUp",
+                "Circle", "Clock", "Cloud", "CloudFog", "CloudRain", "CloudSnow", "Code", "Compass",
+                "Copy", "Cpu", "CreditCard", "Crosshair",
                 "Database", "Download", "Droplet", "Droplets", "Edit", "ExternalLink", "Eye", "EyeOff",
                 "File", "FileText", "Filter", "Flag", "Flame", "Folder",
                 "GitBranch", "GitCommit", "GitMerge", "GitPullRequest", "Globe", "Grid",
                 "Hash", "Heart", "HelpCircle", "Home", "Image", "Info", "Key", "Layers", "Layout",
-                "Link", "List", "Loader", "Lock", "LogIn", "LogOut", "Mail", "MapIcon", "MapPin",
+                "Link", "List", "Loader", "Lock", "LogIn", "LogOut", "Mail", "Map", "MapIcon", "MapPin",
                 "Maximize", "Menu", "MessageCircle", "MessageSquare", "Mic", "Minimize", "Monitor",
                 "Moon", "MoreHorizontal", "MoreVertical", "Mountain", "Move", "Music", "Navigation",
                 "Orbit", "Package", "Pause", "PenTool", "Phone", "Play", "Plus", "Power", "Printer",
                 "Radio", "RefreshCcw", "RefreshCw", "Repeat", "RotateCcw", "RotateCw", "Rss",
-                "Save", "Scissors", "Search", "Send", "Server", "Settings", "Share", "Shield",
-                "ShieldAlert", "ShieldCheck", "Shuffle", "Sidebar", "Signal", "SkipBack", "SkipForward",
-                "Slash", "Sliders", "Smartphone", "Sparkles", "Speaker", "Square", "Star", "StopCircle",
-                "Sun", "Sunrise", "Sunset", "Table", "Tablet", "Tag", "Target", "Telescope", "Terminal",
-                "Thermometer", "ThumbsDown", "ThumbsUp", "ToggleLeft", "ToggleRight", "Tool", "Trash",
+                "Satellite", "Save", "Scissors", "Search", "Send", "Server", "Settings", "Share",
+                "Shield", "ShieldAlert", "ShieldCheck", "Shuffle", "Sidebar", "Signal",
+                "SkipBack", "SkipForward", "Slash", "Sliders", "Smartphone", "Sparkles", "Speaker",
+                "Square", "Star", "StopCircle", "Sun", "Sunrise", "Sunset", "Table", "Tablet", "Tag",
+                "Target", "Telescope", "Terminal", "Thermometer", "ThumbsDown", "ThumbsUp",
+                "ToggleLeft", "ToggleRight", "Tool", "Trash",
                 "TrendingDown", "TrendingUp", "Triangle", "Truck", "Tv", "Type", "Umbrella", "Underline",
                 "Unlock", "Upload", "User", "UserCheck", "UserPlus", "Users", "Video", "Volume",
                 "Volume1", "Volume2", "VolumeX", "Wallet", "Watch", "Waves", "Wifi", "WifiOff",
@@ -4106,10 +4108,16 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     _rcf_mh_lines = _rc_fixed.splitlines()
                     _rcf_mh_new = []
                     _rcf_mh_fixed = 0
+                    _rcf_mh_deduped = 0
                     for _rcf_mhl in _rcf_mh_lines:
                         if '<div' in _rcf_mhl and _rcf_mh_re.search(_rcf_mhl):
                             # Remove any duplicate style= attributes first (LLM patch may have added a second one)
+                            # BUG NOTE: dedup result must be tracked independently — height fix may not apply
+                            # (height already correct), so _rcf_mh_fixed stays 0 and write-back is skipped.
+                            _rcf_mhl_before_dedup = _rcf_mhl
                             _rcf_mhl = re.sub(r'(style=\{\{[^}]+\}\})\s+(style=\{\{[^}]+\}\})', r'\2', _rcf_mhl)
+                            if _rcf_mhl != _rcf_mhl_before_dedup:
+                                _rcf_mh_deduped += 1
                             # Now ensure pixel height
                             if not re.search(r"height:\s*['\"]?\d{3,}", _rcf_mhl):
                                 if "height: '100%'" in _rcf_mhl or 'height:"100%"' in _rcf_mhl:
@@ -4123,9 +4131,12 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                     _rcf_mhl = re.sub(r'(ref=\{[^}]+\})', r"\1 style={{ height: '480px', width: '100%' }}", _rcf_mhl, count=1)
                                 _rcf_mh_fixed += 1
                         _rcf_mh_new.append(_rcf_mhl)
-                    if _rcf_mh_fixed > 0:
+                    if _rcf_mh_fixed > 0 or _rcf_mh_deduped > 0:
                         _rc_fixed = '\n'.join(_rcf_mh_new)
-                        narrate("Dr. Mira Kessler", f"RENDER-FIX AUTO-FIX: Set pixel height on {_rcf_mh_fixed} map container(s) — prevents 0-height collapse.")
+                        if _rcf_mh_fixed > 0:
+                            narrate("Dr. Mira Kessler", f"RENDER-FIX AUTO-FIX: Set pixel height on {_rcf_mh_fixed} map container(s) — prevents 0-height collapse.")
+                        if _rcf_mh_deduped > 0:
+                            narrate("Dr. Mira Kessler", f"RENDER-FIX AUTO-FIX: Removed {_rcf_mh_deduped} duplicate style= attribute(s) on map container(s) — prevents esbuild duplicate-object-key warning.")
 
                 merged_blob["index.tsx"] = _rc_fixed
                 try:
