@@ -81,9 +81,17 @@ def audit_file_operation(filepath: str):
               raise PermissionError(f"EXPANSION_PROTOCOL_VIOLATION: During module creation ({category}), you MUST NOT write files directly to '{rel_path}'. You MUST return the 5-file core JSON object in your response so it can pass the BuildGate.")
     
     # FULL ACCESS BYPASS (Checked after critical expansion/format rules)
+    # EXCEPTION: During patch/repair tasks scoped to a specific module, even software engineers
+    # are restricted to that module's folder. This prevents them from touching system files,
+    # other modules, or node_modules when the user only asked for a targeted fix.
     if is_software_engineer or is_management:
-        print(f"SUDO AUDIT PASSED: Authorized group member '{current_persona}' granted system-wide access to '{rel_path}'.")
-        return 
+        if category in ("patch", "repair") and current_module:
+            # Fall through to module scope enforcement below.
+            # The persona is allowed to READ anything but can only WRITE to backend/modules/{current_module}/
+            pass
+        else:
+            print(f"SUDO AUDIT PASSED: Authorized group member '{current_persona}' granted system-wide access to '{rel_path}'.")
+            return
     
     category = os.environ.get("CURRENT_TASK_CATEGORY", "executive")
     current_module = os.environ.get("CURRENT_MODULE", "").lower()
@@ -108,6 +116,20 @@ def audit_file_operation(filepath: str):
 
     # 4. CURRENT MODULE ENFORCEMENT
     if current_module and current_module != "new_module":
+        # PATCH/REPAIR ABSOLUTE SCOPE LOCK:
+        # During a targeted repair, ONLY the module's own folder is writable.
+        # This overrides even "allowed_root_files" (build.py, llm_router.py, etc.)
+        # because repair tasks must NEVER touch core system files.
+        if category in ("patch", "repair"):
+            expected_prefix = f'backend/modules/{current_module}/'
+            if not rel_path.lower().startswith(expected_prefix.lower()):
+                raise PermissionError(
+                    f"PATCH/REPAIR SCOPE LOCK: During repair of '{current_module}', "
+                    f"only backend/modules/{current_module}/ is writable. "
+                    f"Blocked write to: {rel_path}. "
+                    "Core system files (build.py, llm_router.py, etc.) are READ-ONLY during repairs."
+                )
+
         # Check if the path is within the current module folder
         if rel_path.startswith('backend/modules/'):
             # Must start with backend/modules/{current_module}/

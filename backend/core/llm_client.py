@@ -121,6 +121,15 @@ def reset_client(api_version: str = None):
 
 async def call_llm_async(model_name: str, prompt: str, system_instruction: str = "", tools: list = None, max_tokens: int = 65536, persona_name: str = "Integrity Monitor", history: list = None, attachments: list = None, blocked_models: list = None, thinking_level: str = None, disable_search: bool = False) -> dict:
     """Unified LLM entry point with version-aware routing, Tier-1 caching, and Thought Signature persistence."""
+    if tools is not None and not isinstance(tools, list):
+        logger.error(
+            f"call_llm_async BUG: 'tools' received a {type(tools).__name__} (value={repr(tools)[:80]}) "
+            f"instead of a list. This is almost always a positional-arg mistake — a persona name or "
+            f"system instruction was passed at position 3 (the 'tools' slot) instead of using keyword "
+            f"args. Setting tools=None to prevent SDK crash. Caller should use: "
+            f"call_llm_async(model, prompt, system_instruction=..., persona_name=...)"
+        )
+        tools = None
     current_date = datetime.now().strftime("%B %d, %Y")
     
     # Tier 1: Cache-First Immutable Prefix
@@ -179,11 +188,14 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
         if not model: continue
         narrate(persona_name, f"Attempting connection to {model}...")
         
-        # Timeout: 150s per model. On API-slow days 280s meant one domain could burn 9+ minutes
-        # (280s customtools timeout + 280s pro-preview timeout) before moving on.
-        # 150s is enough for any legitimate response — if a model hasn't replied in 150s, it's stuck.
-        timeout_val = 150 if "3.1" in model else 180
-        max_attempts = 1 if "3.1" in model else 2
+        # Timeout: 200s for 3.1 preview models. 150s was cutting off legitimate responses
+        # during Gemini-side high-demand windows (observed 4/22/2026: 3.1 Pro routinely
+        # returning at 160–190s on congested days). 200s is the empirical sweet spot —
+        # long enough for stressed but healthy responses, short enough to fail over
+        # before burning a full domain's budget on a truly stuck request.
+        timeout_val = 200 if "3.1" in model else 180
+        max_attempts = 2
+        _minimal_budget = 0
         
         for attempt in range(max_attempts):
             stop_event = asyncio.Event()
@@ -217,7 +229,25 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
                         
                         if is_31:
                             if thinking_level == "none":
-                                gen_config.thinking_config = genai.types.ThinkingConfig(include_thoughts=False)
+                                # Attempt to disable thinking via thinking_budget=0.
+                                # Some Gemini 3.1 preview variants only operate in
+                                # thinking mode and reject budget=0 with 400
+                                # "Budget 0 is invalid. This model only works in
+                                # thinking mode." — those are handled below in the
+                                # error handler which sets _minimal_budget = 512
+                                # and retries with budget=512 on the same model.
+                                _budget = _minimal_budget
+                                try:
+                                    gen_config.thinking_config = genai.types.ThinkingConfig(
+                                        include_thoughts=False,
+                                        thinking_budget=_budget if _budget > 0 else 0,
+                                    )
+                                except TypeError:
+                                    # Older SDK without thinking_budget kwarg.
+                                    gen_config.thinking_config = genai.types.ThinkingConfig(
+                                        include_thoughts=False,
+                                        thinking_level="low",
+                                    )
                             else:
                                 level = thinking_level if thinking_level is not None else ("medium" if "pro" in model else "minimal")
                                 gen_config.thinking_config = genai.types.ThinkingConfig(
@@ -338,10 +368,25 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
             except Exception as e:
                 error_str = str(e).upper()
                 narrate(persona_name, f"ERROR with {model}: {str(e)}")
-                
-                if "400" in error_str or "PART TYPE" in error_str or "MESSAGE MUST BE A VALID PART TYPE" in error_str:
-                    narrate(persona_name, "CRITICAL: Detected SDK Part Type mismatch. Pivoting to Local Qwen immediately...")
-                    break 
+
+                # "Budget 0 is invalid. This model only works in thinking mode."
+                # The model requires thinking — retry this same model with a
+                # minimal non-zero budget (512) instead of pivoting away.
+                if "BUDGET 0 IS INVALID" in error_str or "ONLY WORKS IN THINKING MODE" in error_str:
+                    if attempt == 0:
+                        narrate(persona_name, f"RETRY: {model} requires thinking mode — retrying with minimal budget (512).")
+                        _minimal_budget = 512
+                        continue
+                    # Second attempt also failed — break and try next model.
+                    break
+
+                if "PART TYPE" in error_str or "MESSAGE MUST BE A VALID PART TYPE" in error_str:
+                    narrate(persona_name, "CRITICAL: Detected SDK Part Type mismatch. Pivoting to next model...")
+                    break
+
+                if "400" in error_str:
+                    narrate(persona_name, f"CRITICAL: 400 error from {model}. Pivoting to next model...")
+                    break
 
                 if any(word in error_str for word in ["QUOTA", "LIMIT", "429", "503", "DEMAND"]):
                     narrate(persona_name, f"WARNING: {model} still unavailable after retries. Pivoting to fallback...")

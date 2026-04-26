@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from pathlib import Path
 from core.config import Config
 from persona_logger import narrate
 from tools.expansion import RUN_EXPANSION_TASK
@@ -17,8 +18,19 @@ def tool_run_expansion(task_text: str, module_name: str = None) -> str:
     return RUN_EXPANSION_TASK(task_text, module_name=module_name)
 
 def tool_run_repair(repair_text: str) -> str:
-    """Identifies and targets broken or mocked files for repair."""
-    return RUN_REPAIR_TASK(repair_text)
+    """Identifies and targets broken or mocked files for repair. Scoped to CURRENT_MODULE when set."""
+    module_name = os.environ.get("CURRENT_MODULE", "")
+    module_dir = None
+    if module_name:
+        try:
+            from tools.project_map import ProjectMap
+            root = ProjectMap().root_dir
+            candidate = root / "backend" / "modules" / module_name
+            if candidate.exists():
+                module_dir = str(candidate)
+        except Exception:
+            pass
+    return RUN_REPAIR_TASK(repair_text, module_dir=module_dir)
 
 def tool_run_integration(integration_text: str, module_name: str = None) -> str:
     """Syncs modules, validates them, and updates the system manifest."""
@@ -115,7 +127,18 @@ def RUN_BUILD_SCRIPT(module_name: str = None) -> str:
     try:
         import subprocess
         import sys
-        # Dynamic path detection using ProjectMap
+        category = os.environ.get("CURRENT_TASK_CATEGORY", "")
+        current_module = os.environ.get("CURRENT_MODULE", "")
+        if category in ("patch", "repair") and current_module and not module_name:
+            return (
+                f"SCOPE GUARD: Full system rebuild is blocked during repair of '{current_module}'. "
+                f"Call RUN_BUILD_SCRIPT(module_name='{current_module}') to rebuild only that module."
+            )
+        if category in ("patch", "repair") and current_module and module_name and module_name != current_module:
+            return (
+                f"SCOPE GUARD: Cannot build module '{module_name}' during repair of '{current_module}'. "
+                f"Only '{current_module}' can be rebuilt in this task scope."
+            )
         project_root = str(ProjectMap().root_dir).replace('\\', '/')
         backend_dir = os.path.join(project_root, "backend").replace('\\', '/')
         creation_flags = 0x08000000 if os.name == 'nt' else 0

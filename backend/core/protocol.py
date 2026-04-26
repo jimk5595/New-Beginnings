@@ -75,6 +75,8 @@ HARD_RULES = (
     "IMPORT OS RULE: EVERY app.py MUST have `import os` as one of the first lines. This is enforced by the build gate.\n"
     "NO LOCAL AI PORT RULE: NEVER call `http://127.0.0.1:8001` or `http://localhost:8001` in any module route. Use the system's internal `/api/chat/chat` endpoint instead.\n"
     "NO PLACEHOLDER VIEW RULE — BUILD GATE ENFORCED: NEVER create a `PlaceholderView` component for unimplemented navigation views. ALL views MUST be implemented as fully functional components.\n"
+    "CALL_LLM_ASYNC KEYWORD ARG RULE — CRITICAL: NEVER call `call_llm_async` with positional arguments beyond the second (`prompt`). The signature is `call_llm_async(model_name, prompt, system_instruction='', tools=None, max_tokens=65536, persona_name='Integrity Monitor', ...)`. Position 3 is `tools` (a list of callables) — passing a persona name string there crashes ALL Gemini models with a pydantic validation error and exhausts the entire fallback chain. ALWAYS write: `await call_llm_async(model_name='default', prompt=my_prompt, system_instruction=persona_system, persona_name='My Persona')`.\n"
+    "RECHARTS DATA GUARD RULE: ALWAYS initialize chart data state as an empty array `useState<T[]>([])`, never `null`. Pass `data={chartData ?? []}` to every recharts component. Passing `data={null}` or `data={undefined}` throws 'Invariant failed' and crashes the entire view.\n"
 )
 
 # SHARED SYSTEM INSTRUCTIONS FOR BUILD TASKS

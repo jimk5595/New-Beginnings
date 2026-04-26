@@ -1,0 +1,192 @@
+{
+  "_doc": "Module-specific validation rules loaded at runtime by build_gate.py. Keeps route names, variable names, and feature-specific trigger strings OUT of core Python gate logic. Add a new entry here whenever a recurring per-feature validation pattern is discovered. Do NOT put these patterns directly in build_gate.py.",
+  "_schema": {
+    "check_type": "body_guard | presence_guard | tsx_autoload",
+    "body_guard": "Find 'anchor' string in 'target', scan 'body_chars' chars after it. Fire when guard_pattern absent (and optionally fail_pattern present).",
+    "presence_guard": "Fire when any of 'trigger_any' strings appear in 'target' AND guard_pattern is absent from full target.",
+    "tsx_autoload": "Fire when route_substr appears in index.tsx AND is NOT referenced inside a useEffect (only inside click handlers).",
+    "fire_when": "guard_absent | guard_absent_and_fail_present"
+  },
+  "checks": [
+    {
+      "id": "WEATHER_ENSEMBLE_ZERO_EXCLUSION",
+      "check_type": "body_guard",
+      "target": "app.py",
+      "anchor": "owm_temp",
+      "body_chars": 3000,
+      "guard_pattern": "owm_succeeded|owm_ok|owm_valid|owm_temp\\s+if\\s+owm|temps\\s*=\\s*\\[t\\s+for\\s+t\\b|\\[t\\s+for\\s+t\\s+in\\s+\\[.*owm.*\\]\\s+if\\s+t\\s+is\\s+not",
+      "fail_pattern": "temps\\s*=\\s*\\[\\s*owm_temp\\s*,\\s*om_temp\\s*\\]",
+      "fire_when": "guard_absent_and_fail_present",
+      "flags": ["IGNORECASE"],
+      "error_category": "DATA_ERROR",
+      "error_message": "app.py ensemble includes `owm_temp` unconditionally in `temps = [owm_temp, om_temp]`. When OWM fails, owm_temp=0.0 is averaged with the valid Open-Meteo reading — temperature displayed is ~half actual value. Fix: track `owm_succeeded = True` only when OWM returns status 200, then `temps = [t for t in [owm_temp if owm_succeeded else None, om_temp] if t is not None]`. Per WEATHER API FAILED-CALL ZERO EXCLUSION MANDATE."
+    },
+    {
+      "id": "HOURLY_FORECAST_FALLBACK",
+      "check_type": "body_guard",
+      "target": "app.py",
+      "anchor": "/weather/hourly",
+      "body_chars": 3000,
+      "guard_pattern": "open-meteo\\.com/v1/forecast.*hourly=|hourly=temperature_2m",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "DATA_ERROR",
+      "error_message": "/weather/hourly route has no Open-Meteo fallback. When OWM fails (bad key / misconfigured URL), `items=[]` and the frontend shows 'Hourly data unavailable'. Open-Meteo provides free 48h hourly with no key. Add fallback: `if not items:` fetch `https://api.open-meteo.com/v1/forecast?...&hourly=temperature_2m,...` and parse into the items list. Per HOURLY FORECAST OPEN-METEO FALLBACK MANDATE."
+    },
+    {
+      "id": "SEISMIC_PRECURSOR_AUTOLOAD",
+      "check_type": "tsx_autoload",
+      "route_substr": "precursor/analysis",
+      "autoload_patterns": [
+        "useEffect\\s*\\([^)]*\\)\\s*\\{[^}]*precursor/analysis",
+        "fetchPrecursor\\s*\\(\\s*\\)[^}]*useEffect",
+        "useEffect[\\s\\S]{0,500}?precursor",
+        "useEffect[\\s\\S]{0,500}?/precursor/analysis"
+      ],
+      "handler_patterns": [
+        "const\\s+\\w*[Nn]arrative\\w*\\s*=",
+        "const\\s+generate\\w+\\s*=",
+        "onClick.*precursor",
+        "precursor.*onClick"
+      ],
+      "flags": ["DOTALL", "IGNORECASE"],
+      "error_category": "RULES_COMPLIANCE",
+      "error_message": "SEISMIC PRECURSOR AUTO-LOAD MANDATE violated — `/precursor/analysis` is fetched ONLY inside a button click handler, never in a `useEffect` on mount. The Cross-Domain Precursor Analysis panel is empty on initial page load and only fills when the user clicks 'Generate'. Fix: call `fetchPrecursor()` inside the seismic view's mount `useEffect` alongside `fetchData()`. The button should be 'Refresh Analysis', not the only trigger. Per SEISMIC PRECURSOR AUTO-LOAD MANDATE."
+    },
+    {
+      "id": "PLASMA_EMPTY_STRING",
+      "check_type": "presence_guard",
+      "target": "app.py",
+      "trigger_any": ["plasma-7-day.json", "plasma_data"],
+      "guard_pattern": "\\w+\\[1\\]\\s*not\\s+in\\s*\\([^)]*['\"]['\"]",
+      "fire_when": "guard_absent",
+      "error_category": "RULES_COMPLIANCE",
+      "error_message": "PLASMA PARSING ROBUSTNESS MANDATE violated — plasma row filter uses `row[1] is not None` but does not also exclude empty string `''`. NOAA returns '' for missing speed values; `float('')` throws ValueError and the outer except resets speed to 0.0, displaying '0 km/s' or '1 km/s' which is physically impossible. Fix: `row[1] not in ('', None, '-', 'null')` AND `row[2] not in ('', None, '-', 'null')` in the filter. NEVER apply a numeric threshold (e.g. `< 50.0`) to null out parsed values — quiet-sun conditions produce legitimately low readings (300 km/s is valid solar wind). Return `None` ONLY when the API call itself fails or the response contains no usable rows."
+    },
+    {
+      "id": "FIRMS_WORLD_URL",
+      "check_type": "presence_guard",
+      "target": "app.py",
+      "trigger_any": ["firms.modaps.eosdis.nasa.gov", "NASA_FIRMS", "VIIRS_SNPP_NRT"],
+      "guard_pattern": "/world/",
+      "fire_when": "guard_absent",
+      "error_category": "DATA_ERROR",
+      "error_message": "FIRMS URL MANDATE violated — NASA FIRMS API call does not use the global `world` country code. Using a country-specific code (e.g., USA, CAN) returns only fires in that country, causing the Hazard Center to show 0 active wildfires globally despite thousands of fires burning worldwide. Fix: replace the country code segment with `world`: `https://firms.modaps.eosdis.nasa.gov/api/country/csv/{key}/VIIRS_SNPP_NRT/world/1`. Per FIRMS CSV CONTRACT in rules.md."
+    },
+    {
+      "id": "ASTRONOMY_ENDPOINT_TIMEOUT",
+      "check_type": "body_guard",
+      "target": "app.py",
+      "anchor": "astronomy/stars",
+      "body_chars": 4000,
+      "guard_pattern": "timeout\\s*=\\s*(?:2[0-9](?:\\.0)?|30(?:\\.0)?)",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "DATA_ERROR",
+      "error_message": "ASTRONOMY TIMEOUT MANDATE violated — the /astronomy/stars route does not specify a timeout >= 20s on its httpx client. The ESA Gaia TAP service regularly takes 20-30 seconds to return 2000 star records. With the default 15s httpx timeout, the request silently fails and the frontend shows 'Data acquisition timed out after 10 seconds'. Fix: use `httpx.AsyncClient(timeout=30.0)` in both /astronomy/stars and /astronomy/skyview routes. Per ASTRONOMY API TIMEOUT MANDATE."
+    },
+    {
+      "id": "OCEAN_CURRENT_VECTORS",
+      "check_type": "presence_guard",
+      "target": "app.py",
+      "trigger_any": ["ocean/current", "/ocean/current"],
+      "guard_pattern": "current_vectors|\\bocean_current_direction\\b|\\bcurrent_direction\\b",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "DATA_ERROR",
+      "error_message": "OCEAN CURRENT VECTORS MANDATE violated — the /ocean/current route does not return per-point current vector data (`current_vectors` array or `ocean_current_direction` field). Without directional data for multiple ocean points, the frontend renders all current arrows pointing in the exact same direction (single global bearing applied uniformly), which is scientifically meaningless. Fix: fetch `ocean_current_velocity` and `ocean_current_direction` from Open-Meteo Marine API (`https://marine-api.open-meteo.com/v1/marine?hourly=ocean_current_velocity,ocean_current_direction`) and return a `current_vectors` list with per-point `{lat, lon, speed_kt, direction_deg}` entries for at least 6 major ocean basin sample points. Per OCEAN CURRENT MULTI-POINT MANDATE."
+    },
+    {
+      "id": "MARINE_FORECAST_DAILY",
+      "check_type": "body_guard",
+      "target": "app.py",
+      "anchor": "/ocean/current",
+      "body_chars": 5000,
+      "guard_pattern": "daily_forecast|marine.*daily|\\bdaily=wave_height|forecast_days",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "DATA_ERROR",
+      "error_message": "MARINE FORECAST AUTOLOAD MANDATE violated — the /ocean/current route does not fetch or return a `daily_forecast` array. The 7-Day Marine Forecast panel shows 'Awaiting 7-day extended marine forecast telemetry' indefinitely because no forecast data is included in the response. Fix: add a concurrent fetch to Open-Meteo Marine API with `daily=wave_height_max,wave_period_max,wind_speed_10m_max,visibility_mean&forecast_days=7` and return the results as `daily_forecast: [{date, wave_height_ft, wave_period_s, wind_speed_mph, visibility_mi}]` alongside the existing current conditions data. Per MARINE FORECAST AUTOLOAD MANDATE."
+    },
+    {
+      "id": "SPACE_WEATHER_FLARE_ENDPOINT",
+      "check_type": "body_guard",
+      "target": "app.py",
+      "anchor": "/space/current",
+      "body_chars": 6000,
+      "guard_pattern": "xrays-1-day\\.json|f107_cm_flux\\.json|solar_flares_24h|radio_flux_sfu|goes.*primary|xrays.*1.day",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "DATA_ERROR",
+      "error_message": "SPACE WEATHER COMPLETE TELEMETRY MANDATE violated — the /space/current route does not fetch solar flare data from NOAA SWPC. The Solar Activity panel shows 'Awaiting Telemetry' for Solar Flares (24h) and Radio Flux (10.7cm) because these endpoints are never called. Fix: add concurrent fetches to (1) `{NOAA_SWPC_URL}/json/goes/primary/xrays-1-day.json` for solar flare counts, (2) `{NOAA_SWPC_URL}/json/f107_cm_flux.json` for radio flux sfu value. Return `solar_flares_24h: {X: int, M: int, C: int}` and `radio_flux_sfu: float` in the response. Per SPACE WEATHER COMPLETE TELEMETRY MANDATE."
+    },
+    {
+      "id": "AILAB_MODELS_COMPARISON_DATA",
+      "check_type": "body_guard",
+      "target": "app.py",
+      "anchor": "/ailab/models",
+      "body_chars": 4000,
+      "guard_pattern": "comparison_points|gfs_temp|ecmwf_temp|ecmwf_ifs04|gfs_seamless|icon_seamless|models=",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "DATA_ERROR",
+      "error_message": "AI LAB MODEL COMPARISON AUTOLOAD MANDATE violated — the /ailab/models route does not return a `comparison_points` array with per-model temperature data. The Ensemble Forecast Divergence chart renders empty because it has no data to display. Fix: fetch Open-Meteo with multiple models concurrently using `models=gfs_seamless,ecmwf_ifs04,icon_seamless` and return `comparison_points: [{hour_label, gfs_temp, ecmwf_temp, icon_temp}]` for the next 24 hours. Use OPEN_METEO_SUITE_URL env var (default: https://api.open-meteo.com/v1/forecast). Per AI LAB MODEL COMPARISON AUTOLOAD MANDATE."
+    },
+    {
+      "id": "WEATHER_ICON_MAPPING",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["hourly", "48-Hour", "14-Day", "Hourly Forecast", "daily forecast"],
+      "guard_pattern": "getConditionIcon|getWeatherIcon|includes.*rain.*CloudRain|includes.*thunder.*Cloud|description.*icon|weatherCode.*icon|condition.*icon",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "UI_ERROR",
+      "error_message": "WEATHER FORECAST CONDITION ICON MANDATE violated — index.tsx renders hourly or daily forecast cards but contains no weather condition icon mapping function. Forecast cards show only text descriptions ('Moderate rain', 'Clear sky') with no visual icons. Fix: implement `function getConditionIcon(description: string): React.ReactNode` that maps description substrings to lucide-react icons (CloudLightning for thunder, CloudRain for rain, Cloud for cloudy, Sun for clear, Eye for fog). Call this function inside every hourly card and every 14-day card JSX to render the icon above the temperature. Per WEATHER FORECAST CONDITION ICON MANDATE."
+    },
+    {
+      "id": "SOLAR_WIND_THRESHOLD_FORBIDDEN",
+      "check_type": "body_guard",
+      "target": "app.py",
+      "anchor": "/space/current",
+      "body_chars": 6000,
+      "guard_pattern": "solar_wind_speed\\s*<\\s*\\d+|speed\\s*<\\s*50|wind_speed\\s*<\\s*50",
+      "fire_when": "guard_present",
+      "flags": ["IGNORECASE"],
+      "error_category": "RULES_COMPLIANCE",
+      "error_message": "SOLAR WIND LIVE DATA MANDATE violated — the /space/current route applies a numeric minimum-value threshold (e.g. `if solar_wind_speed < 50: solar_wind_speed = None`) that nullifies valid quiet-sun solar wind readings. During quiet solar conditions, real solar wind speed is 300-500 km/s and Bz / flux values legitimately approach zero. Applying a threshold kills these valid readings and causes 'Sensor Offline' to display even when NOAA SWPC is fully operational. Fix: REMOVE the numeric threshold entirely. Return `None` ONLY when the API call fails or the response contains no usable data rows (empty string, null, '-'). The `NEVER` rule from SOLAR WIND LIVE DATA MANDATE must be enforced here. Per SOLAR WIND LIVE DATA MANDATE."
+    },
+    {
+      "id": "WHATIF_SCENARIO_AUTOLOAD",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["What-If", "WhatIf", "whatif", "Scenario Builder", "whatIfOffset", "whatif_offset", "temperature forcing"],
+      "guard_pattern": "useEffect[\\s\\S]{0,600}?(?:ailab/models|comparison_points|whatif|gfs_temp|ecmwf_temp)",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE", "DOTALL"],
+      "error_category": "RULES_COMPLIANCE",
+      "error_message": "AI LAB WHAT-IF SCENARIO AUTOLOAD MANDATE violated — the What-If Scenario tab contains a chart (Model Divergence Simulation / GFS vs ECMWF Sensitivity) but the base model data is never fetched in a useEffect on mount. The chart shows empty on initial load because comparison_points data only arrives when the slider is moved. Fix: fetch `/ailab/models?lat={lat}&lon={lon}` inside a `useEffect(() => { fetchModels(); }, [lat, lon])` so the base GFS/ECMWF temperature lines render immediately on tab load. The slider adjusts an `offset` applied to this pre-loaded baseline — it does NOT trigger a new API call. Per AI LAB MODEL COMPARISON AUTOLOAD MANDATE."
+    },
+    {
+      "id": "PATTERN_STUDIO_NODE_CLICK",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["Pattern Studio", "PatternStudio", "Convergence Core", "topology", "convergence_topology", "domain_reports"],
+      "guard_pattern": "onClick[\\s\\S]{0,200}?(?:selectedNode|nodeDetail|setSelected|personaDetail|anomalyDetail)|(?:selectedNode|nodeDetail|setSelected)[\\s\\S]{0,400}?onClick",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE", "DOTALL"],
+      "error_category": "UI_ERROR",
+      "error_message": "PATTERN STUDIO NODE CLICK DETAIL MANDATE violated — the Pattern Studio topology renders persona nodes (Dr. Lena Vance, Gale Hawthorne, etc.) and ANOMALY/NOMINAL labels, but node onClick handlers are absent or do not update any state (selectedNode / nodeDetail / setSelected). Clicking a node does nothing. Fix: add `onClick={() => setSelectedNode(persona)}` to every node element; render a side panel or modal showing the persona's domain report text from `precursorData.domain_reports[personaName]`, their signal status badge, and the anomaly keywords. The Convergence Core node must show the full synthesis text on click. The detail panel must be dismissible. Per PATTERN STUDIO NODE CLICK DETAIL MANDATE."
+    },
+    {
+      "id": "RADAR_NOWCAST_FRONTEND",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["rainviewer", "nowcast_frames", "radar.past", "past_frames", "radar.*timeline", "isForecast"],
+      "guard_pattern": "nowcast_frames|isForecast|\\bForecast\\b.*frames?|frames?.*[Ff]orecast|nowcast",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "RULES_COMPLIANCE",
+      "error_message": "RADAR FORECAST FRAMES MANDATE violated — the frontend radar timeline references past frames but does not reference `nowcast_frames` or `isForecast`. Even if the backend correctly returns `nowcast_frames`, the frontend will show 'No forecast data' if it only reads `past_frames` from the response. Fix: merge both arrays: `const allFrames = [...(data.past_frames||[]).map(f=>({...f,isForecast:false})), ...(data.nowcast_frames||[]).map(f=>({...f,isForecast:true}))]; setFrames(allFrames);`. Label forecast frames with 'Forecast' prefix on the timestamp. The timeline slider must cover all frames. Per RADAR FORECAST FRAMES MANDATE."
+    }
+  ]
+}

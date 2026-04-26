@@ -166,6 +166,76 @@ class CrossModuleDependencyChecker:
                     
         return {"status": "passed"}
 
+
+class APIKeyLeakageChecker:
+    """Scan app.py route return statements for API key exposure.
+
+    Root cause: AI models sometimes include os.getenv() values directly in
+    route return dicts (e.g., 'some_secret_key': secret_var), leaking secrets
+    to the frontend via JSON responses.
+
+    Generic, domain-agnostic: flags any variable whose name suggests a secret
+    (matches /key|secret|token|password|api/i) that is loaded via os.getenv()
+    and subsequently serialized back in a route return statement.
+
+    Allow-listing of specific pass-through keys (e.g. tile-layer keys that
+    must be embedded client-side) is controlled per-module via a
+    `.api_key_allowlist` file in the module directory — one key name per line.
+    No module specifics are hardcoded in this core checker.
+    """
+    _SECRET_VAR_PATTERN = (
+        r'\b(\w*(?:secret|token|password|api[_-]?key|_key)\w*)\s*=\s*os\.getenv\('
+    )
+
+    def _load_allowlist(self, module_path: Path) -> set:
+        allow_file = module_path / ".api_key_allowlist"
+        if not allow_file.exists():
+            return set()
+        try:
+            return {
+                line.strip()
+                for line in allow_file.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            }
+        except Exception:
+            return set()
+
+    def validate(self, module_path: Path) -> Dict[str, Any]:
+        app_file = module_path / "app.py"
+        if not app_file.exists():
+            return {"status": "passed"}
+        try:
+            content = app_file.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return {"status": "passed"}
+
+        allowlist = self._load_allowlist(module_path)
+        leaked = []
+        for m in re.finditer(self._SECRET_VAR_PATTERN, content, re.IGNORECASE):
+            var_name = m.group(1).strip()
+            if var_name in allowlist:
+                continue
+            if f'"{var_name}"' in content or f"'{var_name}'" in content:
+                return_search = re.search(
+                    rf'return\s*\{{[^}}]*["\'][\w]*{re.escape(var_name)}[\w]*["\'][^}}]*\}}',
+                    content[m.start():m.start() + 2000],
+                    re.DOTALL | re.IGNORECASE,
+                )
+                if return_search:
+                    leaked.append(var_name)
+
+        if leaked:
+            return {
+                "status": "failed",
+                "error": (
+                    f"SECURITY: API key variable(s) found in route return statements: {leaked}. "
+                    "Never return sensitive os.getenv() values to the frontend. "
+                    "If a specific key MUST be exposed (e.g. map tile-layer keys), add its name "
+                    "to the module's `.api_key_allowlist` file."
+                ),
+            }
+        return {"status": "passed"}
+
 class FailureClassificationEngine:
     """Classify failures (wiring, schema, runtime, etc.)."""
     def classify(self, failures: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -209,7 +279,7 @@ class ActivationSafetyGate:
         return validation_results.get("overall_status") == "passed"
 
 class ValidationEngine:
-    """Orchestrates all 13 validation systems."""
+    """Orchestrates all validation systems."""
     def __init__(self):
         self.simulator = RuntimeSimulator()
         self.discoverer = EndpointDiscoverer()
@@ -220,6 +290,7 @@ class ValidationEngine:
         self.manifest = ManifestConsistencyChecker()
         self.data_flow = DataFlowIntegrityChecker()
         self.dependency = CrossModuleDependencyChecker()
+        self.key_leakage = APIKeyLeakageChecker()
         self.classifier = FailureClassificationEngine()
         self.router = DebugRoutingEngine()
         self.gate = ActivationSafetyGate()
@@ -280,15 +351,20 @@ class ValidationEngine:
         results["cross_module_dependency"] = res
         if res["status"] == "failed": failures.append(res)
 
-        # 10. Classification (if failures)
+        # 10. API Key Leakage
+        res = self.key_leakage.validate(module_path)
+        results["api_key_leakage"] = res
+        if res["status"] == "failed": failures.append(res)
+
+        # 11. Classification (if failures)
         classified = self.classifier.classify(failures)
         results["failure_classification"] = classified
 
-        # 11. Routing
+        # 12. Routing
         routing = self.router.route(classified)
         results["debug_routing"] = routing
 
-        # 12. Safety Gate
+        # 13. Safety Gate
         overall_status = "passed" if not failures else "failed"
         results["overall_status"] = overall_status
         results["activation_authorized"] = self.gate.check(results)

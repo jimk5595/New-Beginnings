@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from typing import Dict, List
 from persona_logger import narrate
 
@@ -224,7 +225,27 @@ PER_VIEW_TEST_JS = r"""async () => {
 
             const report = { view: label, issues: [] };
 
-            const maps = document.querySelectorAll('.leaflet-container, [class*="map-container"], [class*="mapContainer"]');
+            // Scope every per-view check to the view container itself (not the whole document).
+            // Without scoping, a single decorative button on the persistent shell (e.g. the
+            // Weather page's "Radar" toggle) is reported once per nav click, producing N
+            // duplicate failures and confusing the render-fix patcher about which view to
+            // patch. Pick the largest visible <main>/<section>/<div role=main> that is not
+            // the body/root, falling back to <main> or <body> when none is found.
+            function pickViewRoot() {
+                const candidates = Array.from(document.querySelectorAll(
+                    'main, [role="main"], section, [class*="view-"], [class*="View"], [class*="page-"], [class*="Page"], [class*="content"]'
+                )).filter(el => {
+                    if (!el.offsetHeight || !el.offsetWidth) return false;
+                    if (el.tagName === 'BODY' || el.id === 'root') return false;
+                    if (el.querySelector('nav, aside')) return false;
+                    return el.offsetWidth >= window.innerWidth * 0.4;
+                });
+                candidates.sort((a, b) => (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight));
+                return candidates[0] || document.querySelector('main') || document.body;
+            }
+            const viewRoot = pickViewRoot();
+
+            const maps = viewRoot.querySelectorAll('.leaflet-container, [class*="map-container"], [class*="mapContainer"]');
             if (maps.length > 0) {
                 let mapsRendered = 0;
                 maps.forEach(mc => {
@@ -240,14 +261,28 @@ PER_VIEW_TEST_JS = r"""async () => {
                     if (mc.offsetHeight < 10 || mc.offsetWidth < 10) {
                         report.issues.push(`VIEW "${label}": Map container has 0 height/width — invisible. Needs explicit height style.`);
                     }
+                    // MARKER-VS-DATA CHECK: Leaflet marker layers must contain markers when
+                    // sibling/parent panels show numeric data > 0 (e.g. "Earthquakes (7-Day Total): 376").
+                    const markerLayer = mc.querySelector('.leaflet-marker-pane, .leaflet-overlay-pane');
+                    const markerCount = markerLayer ? markerLayer.children.length : 0;
+                    const viewRoot = mc.closest('section, main, div[class*="view"], div[class*="View"]') || document.body;
+                    const numericTexts = Array.from(viewRoot.querySelectorAll('[class*="card"] *, [class*="stat"] *, [class*="metric"] *'))
+                        .map(el => (el.innerText || '').trim()).filter(t => /^\d{1,5}$/.test(t) && parseInt(t, 10) > 0);
+                    if (numericTexts.length >= 1 && markerCount === 0 && mc.offsetHeight > 50) {
+                        report.issues.push(`VIEW "${label}": Map shows 0 markers but data cards report ${numericTexts.slice(0,3).join(', ')} active items — markers not plotted. Likely: data fetched but markers not added to map layer.`);
+                    }
                 });
             }
 
-            const btns = document.querySelectorAll('button, [role="button"]');
+            const btns = viewRoot.querySelectorAll('button, [role="button"]');
             let viewBtns = 0, viewBtnsWithHandlers = 0;
             const deadBtnLabels = [];
             btns.forEach(btn => {
                 if (!btn.offsetHeight || !btn.offsetWidth) return;
+                // Exclude native Leaflet control buttons (zoom +/−, layer controls, attribution).
+                // These use Leaflet's own event system and never have React __reactProps handlers,
+                // so they would always trigger the "no click handlers" false-positive check.
+                if (btn.closest('.leaflet-control')) return;
                 viewBtns++;
                 if (btn.onclick || checkReactHandlers(btn)) {
                     viewBtnsWithHandlers++;
@@ -260,7 +295,7 @@ PER_VIEW_TEST_JS = r"""async () => {
                 report.issues.push(`VIEW "${label}": ${viewBtns} visible button(s) but NONE have click handlers. Examples: ${deadBtnLabels.join(', ')}`);
             }
 
-            const dataSections = document.querySelectorAll('[class*="card"], [class*="Card"], table, [class*="panel"], [class*="Panel"]');
+            const dataSections = viewRoot.querySelectorAll('[class*="card"], [class*="Card"], table, [class*="panel"], [class*="Panel"]');
             let withContent = 0, empty = 0;
             dataSections.forEach(ds => {
                 if (!ds.offsetHeight || !ds.offsetWidth) return;
@@ -272,14 +307,44 @@ PER_VIEW_TEST_JS = r"""async () => {
                 report.issues.push(`VIEW "${label}": ${dataSections.length} data section(s) found but ALL are empty — no data displayed`);
             }
 
-            const toggles = document.querySelectorAll('input[type="checkbox"], input[type="radio"], [role="switch"]');
-            if (toggles.length > 0) {
+            // TOGGLE / LAYER CONTROL CHECK — includes input toggles AND button-style layer tabs
+            const inputToggles = viewRoot.querySelectorAll('input[type="checkbox"], input[type="radio"], [role="switch"]');
+            if (inputToggles.length > 0) {
                 let responsive = 0;
-                toggles.forEach(t => { if (t.onchange || t.onclick || checkReactHandlers(t)) responsive++; });
+                inputToggles.forEach(t => { if (t.onchange || t.onclick || checkReactHandlers(t)) responsive++; });
                 if (responsive === 0) {
-                    report.issues.push(`VIEW "${label}": ${toggles.length} toggle(s) found but NONE have handlers`);
+                    report.issues.push(`VIEW "${label}": ${inputToggles.length} input toggle(s) found but NONE have handlers`);
                 }
             }
+
+            // BUTTON-STYLE LAYER CONTROL CHECK — buttons/spans labeled with layer keywords
+            // that don't have React onClick handlers are purely decorative and non-interactive.
+            const layerKeywords = /^(SST|Currents?|Radar|Temperature|Wind|Precipitation|Layer|Toggle|Overlay)/i;
+            const allVisibleBtns = viewRoot.querySelectorAll('button, [role="button"]');
+            const layerBtns = Array.from(allVisibleBtns).filter(el => {
+                if (!el.offsetHeight || !el.offsetWidth) return false;
+                const txt = (el.textContent || '').trim();
+                return layerKeywords.test(txt);
+            });
+            if (layerBtns.length > 0) {
+                let layerBtnsWithHandler = 0;
+                layerBtns.forEach(btn => {
+                    if (btn.onclick || checkReactHandlers(btn)) layerBtnsWithHandler++;
+                });
+                if (layerBtnsWithHandler === 0) {
+                    const names = layerBtns.slice(0, 3).map(b => (b.textContent||'').trim().substring(0,25)).join(', ');
+                    report.issues.push(`VIEW "${label}": ${layerBtns.length} layer-control button(s) [${names}] have NO onClick handler — they are decorative and cannot toggle map layers`);
+                }
+            }
+
+            // MAP HEIGHT OVERFLOW CHECK — map containers taller than 85% of viewport
+            // indicate missing height constraints (h-full / flex-grow without bounds).
+            const mapContainersInView = document.querySelectorAll('.leaflet-container, [class*="map-container"], [class*="mapContainer"]');
+            mapContainersInView.forEach(mc => {
+                if (mc.offsetHeight > window.innerHeight * 0.85) {
+                    report.issues.push(`VIEW "${label}": Map container is ${mc.offsetHeight}px tall (viewport=${window.innerHeight}px) — exceeds 85% viewport height. Add an explicit max-height or fixed height style to prevent blank tile overflow.`);
+                }
+            });
 
             // DATA DESERT CHECK: detect views showing only zeros, dashes, and N/A with no real data.
             // IMPORTANT: ALL-CAPS label text (e.g. "WIND DYNAMICS", "RECENT QUAKES (7D)") and
@@ -312,7 +377,12 @@ PER_VIEW_TEST_JS = r"""async () => {
                        s.includes('View Render Error') || s.includes('Render Error') ||
                        s.includes('View Error') || s.includes('Something went wrong') ||
                        s.includes('Component Error') || s.includes('critical error') ||
-                       s.includes('application shell has safely caught');
+                       s.includes('application shell has safely caught') ||
+                       s.includes('Module Rendering Error') || s.includes('Module Render Error') ||
+                       s.includes('Rendering Error') || s.includes('View Crashed') ||
+                       s.includes('View Render Failure') || s.includes('Attempt Recovery') ||
+                       s.includes('Retry View Initialization') || s.includes('Invariant failed') ||
+                       (s.includes('Constructor') && s.includes("requires 'new'"));
             }
             const allHeadings = document.querySelectorAll('h1, h2, h3, h4, h5');
             allHeadings.forEach(h => {
@@ -339,7 +409,11 @@ PER_VIEW_TEST_JS = r"""async () => {
                         report.issues.push(`VIEW "${label}": ErrorBoundary crash — "${errMsg || t}". This view crashes on render.`);
                     }
                     // Catch raw JS runtime errors shown in DOM (e.g. "Lucide is not defined")
-                    if ((t.includes('is not defined') || t.includes('Cannot access') || t.includes('before initialization')) && !seenErrors.has(t)) {
+                    if ((t.includes('is not defined') || t.includes('Cannot access') ||
+                         t.includes('before initialization') || t.includes("requires 'new'") ||
+                         t.includes('Cannot read properties') || t.includes('is not a function') ||
+                         t.includes('Invariant failed') || t.includes('TypeError:') ||
+                         t.includes('ReferenceError:')) && !seenErrors.has(t)) {
                         seenErrors.add(t);
                         report.issues.push(`VIEW "${label}": Runtime JS error in DOM — "${t}". Component crashed.`);
                     }
@@ -367,6 +441,7 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
         "page_title": "",
         "functional": {},
         "functional_failures": [],
+        "api_404s": [],
     }
     url = f"http://127.0.0.1:{port}/static/built/modules/{module_name}/index.html"
     narrate("Dr. Mira Kessler", f"Render check: loading {url} in headless browser...")
@@ -386,6 +461,7 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
         page = await browser.new_page()
 
         console_errors = []
+        api_404s = []
 
         def _on_console(msg):
             if msg.type in ("error", "warning"):
@@ -394,8 +470,15 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
         def _on_page_error(error):
             console_errors.append(f"[uncaught] {error.message if hasattr(error, 'message') else str(error)}")
 
+        def _on_response(response):
+            if response.status == 404 and '/api/' in response.url:
+                path = response.url.split('/api/', 1)[-1] if '/api/' in response.url else response.url
+                if path not in api_404s:
+                    api_404s.append(path)
+
         page.on("console", _on_console)
         page.on("pageerror", _on_page_error)
+        page.on("response", _on_response)
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -538,12 +621,38 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
             view_reports = nav_test.get("view_reports", [])
             if view_reports:
                 narrate("Dr. Mira Kessler", f"Per-view test: {len(view_reports)} view(s) have functional issues.")
+                # Deduplicate identical issue payloads across views. Without this, a
+                # single shell-level decorative button (or any element shared between
+                # views) is reported once per nav click, ballooning the failure list
+                # and confusing the targeted-patch repair into thinking 4 separate
+                # fixes are required when only ONE button needs an onClick handler.
+                _seen_iss_signatures = set()
                 for vr in view_reports:
                     for iss in vr.get("issues", []):
+                        # Strip the leading `VIEW "<label>": ` prefix so the same
+                        # underlying defect collapses to a single signature regardless
+                        # of which view's nav button surfaced it.
+                        _sig = re.sub(r'^VIEW "[^"]*":\s*', '', iss).strip()
+                        if _sig in _seen_iss_signatures:
+                            continue
+                        _seen_iss_signatures.add(_sig)
                         narrate("Dr. Mira Kessler", f"  VIEW FAIL: {iss[:200]}")
                         functional_failures.append(iss)
         except Exception as nav_err:
             narrate("Dr. Mira Kessler", f"Per-view test error (non-fatal): {nav_err}")
+
+        # API 404 DETECTION: report any /api/ routes that returned 404 during this session.
+        # These indicate a mismatch between frontend fetches and registered backend routes.
+        # Surfacing them here lets the render-fix LLM (and the MISSING ROUTE REPAIR handler)
+        # know that a backend route is absent — not just a JS crash or empty DOM.
+        result["api_404s"] = api_404s
+        if api_404s:
+            functional_failures.append(
+                f"API 404: {len(api_404s)} backend route(s) returned 404 — "
+                f"frontend fetches these but they are not registered in app.py: "
+                + ", ".join(f"/{p}" for p in api_404s[:8])
+                + ". Add the missing @router.get/post entries to app.py."
+            )
 
         result["functional_failures"] = functional_failures
 

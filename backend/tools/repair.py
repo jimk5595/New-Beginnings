@@ -29,13 +29,19 @@ def RUN_REPAIR_TASK(task_text: str, project_map: ProjectMap = None, module_dir: 
     root_dir = Path(project_map.root_dir)
     target_files = []
     
-    # 1. ANALYZE TASK for file hints
+    # 1. ANALYZE TASK for file hints — scoped to module_dir when provided
+    _scope_root = Path(module_dir).resolve() if module_dir else None
     words = task_text.replace(",", " ").replace(";", " ").split()
     for word in words:
         if "." in word:
             found = project_map.find_file_by_name(word)
             if found:
-                target_files.extend(found)
+                for f in found:
+                    abs_f = (root_dir / f).resolve()
+                    if _scope_root and not str(abs_f).startswith(str(_scope_root)):
+                        narrate("Alex Rivera", f"SCOPE GUARD: Skipping out-of-module file: {f}")
+                        continue
+                    target_files.append(f)
     
     # 2. SCAN FOR MOCKS — scoped to module_dir only to prevent cross-module contamination
     if "mock" in task_text.lower() or "real" in task_text.lower() or "fix" in task_text.lower():
@@ -86,7 +92,11 @@ def RUN_REPAIR_TASK(task_text: str, project_map: ProjectMap = None, module_dir: 
     )
 
     for rel_path in target_files:
-        abs_path = root_dir / rel_path
+        abs_path = (root_dir / rel_path).resolve()
+        if _scope_root and not str(abs_path).startswith(str(_scope_root)):
+            narrate("Alex Rivera", f"SCOPE GUARD (write): Blocked write to out-of-module path: {rel_path}")
+            failed.append(rel_path)
+            continue
         try:
             with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
                 broken_content = f.read()

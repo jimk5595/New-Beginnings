@@ -51,6 +51,23 @@ class TaskClassifier:
         """
         task_lower = task.lower().strip()
 
+        # -1. STOP / HALT FAST-PATH — must fire BEFORE any other classification.
+        # Single-word or short stop commands must NEVER be treated as a build target.
+        # The orchestrator handles actual task cancellation; the classifier just needs
+        # to route these as conversational so the orchestrator's stop_signals block fires.
+        _stop_exact = [
+            "stop", "halt", "cancel", "abort", "pause",
+            "stop it", "stop that", "stop this", "stop now", "stop everything",
+            "stop the build", "stop all", "stand down", "kill it", "kill that",
+            "never mind", "nevermind", "forget it", "forget that",
+        ]
+        if task_lower in _stop_exact or any(task_lower == s for s in _stop_exact):
+            return "conversational"
+        # Short messages (≤6 words) whose first word is a stop verb → conversational
+        _words = task_lower.split()
+        if len(_words) <= 6 and _words[0] in ("stop", "halt", "cancel", "abort", "pause", "nevermind"):
+            return "conversational"
+
         # 0. CONVERSATIONAL FAST-PATH — only scan the first 300 chars so long build
         #    prompts with embedded words like "explain" don't get misclassified.
         task_head = task_lower[:300]
@@ -157,6 +174,13 @@ class TaskClassifier:
             "update the header", "update the footer", "update the button",
             "update the title", "update the nav", "update the sidebar",
             "adjust the", "modify the",
+            # Natural phrasing for targeted UI/UX adjustments
+            "make the", "move the", "rename the", "swap the", "replace the",
+            "the spacing", "the padding", "the margin", "the layout",
+            "the wording", "the copy", "the placeholder", "the tooltip",
+            "can you fix the", "can you adjust", "can you update the",
+            "can you change the", "can you move the", "can you make the",
+            "please fix", "please adjust", "please update", "please change",
         ]
         patch_blockers = ["new module", "rebuild", "new feature", "create a", "build a", "generate a"]
         if any(kw in task_lower for kw in patch_intent) and not any(kw in task_lower for kw in patch_blockers):
@@ -169,6 +193,18 @@ class TaskClassifier:
             "repair the build", "fix the json", "repair the json",
             "fix module.json", "repair module.json", "fix the error",
             "repair the error",
+            # Natural phrasing for broken UI / data issues
+            "isn't working", "is not working", "doesn't work", "does not work",
+            "isn't showing", "is not showing", "not displaying", "not loading",
+            "not rendering", "won't load", "will not load", "keeps breaking",
+            "is broken", "is blank", "is empty", "shows nothing", "shows blank",
+            "not fetching", "not updating", "stuck on", "frozen on",
+            "the map is", "the chart is", "the table is", "the graph is",
+            "the radar", "the forecast", "the data isn't", "the data is not",
+            "broken layout", "broken page", "broken component",
+            "fix the radar", "fix the map", "fix the chart", "fix the table",
+            "fix the forecast", "fix the page", "fix the view", "fix the layout",
+            "the api is", "api not", "api isn't", "endpoint is broken",
         ]
         if any(kw in task_lower for kw in repair_intent):
             return "repair"
@@ -237,8 +273,8 @@ class TaskClassifier:
             from llm_router import call_llm_async
             from core.config import Config
             config = Config()
-            prompt = f"Classify this task into one category: conversational, build, expansion, patch, repair, integration, backend, frontend, system, debugging, or executive. Use 'patch' for small targeted changes to existing modules (tweak, adjust, change X in module Y). TASK: {task}"
-            instr = "You are a high-speed intent classifier. Return ONLY the category name in lowercase. Use 'conversational' for any chat, questions, opinions, or discussion that is not a technical action. Use 'patch' for small targeted changes to existing module files."
+            prompt = f"Classify this task into one category: conversational, build, expansion, patch, repair, integration, backend, frontend, system, debugging, or executive. Use 'patch' for small targeted changes to existing modules (tweak, adjust, change X in module Y). Use 'repair' when something is broken, not working, not showing, not loading, or the user says 'fix' something that exists. TASK: {task}"
+            instr = "You are a high-speed intent classifier. Return ONLY the category name in lowercase. Use 'conversational' for any chat, questions, opinions, or discussion that is not a technical action. Use 'patch' for small targeted changes to existing module files. Use 'repair' when the user reports something broken, not rendering, blank, or not working in an existing module. NEVER return 'build' for a task that is about fixing something that already exists."
             ai_res = await call_llm_async(config.GEMINI_MODEL_31_FLASH_LITE, prompt, system_instruction=instr)
             ai_res = ai_res.get("text", "").strip().lower()
             if ai_res in ["conversational", "build", "expansion", "patch", "repair", "integration", "backend", "frontend", "system", "debugging", "executive"]:

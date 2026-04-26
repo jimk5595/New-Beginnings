@@ -1,0 +1,79 @@
+{
+  "_doc": "Data-driven deterministic repair registry. The build pipeline loads this file and applies pattern-based fixes when build_gate reports the matching error_signature. Each entry is fully generic — NO module names, NO hardcoded module-specific identifiers. Patterns operate on idiom-level code shapes that appear in any module that triggers the matching rule.",
+  "_schema": {
+    "id": "Stable identifier for narration / dedup.",
+    "error_signature": "Substring matched against build_gate error text. Case-sensitive.",
+    "target_file": "Blob key — usually 'index.tsx' or 'app.py'.",
+    "type": "regex_sub | regex_replace_first",
+    "pattern": "Python re pattern. Use named groups when needed.",
+    "replacement": "re.sub replacement string. Backrefs allowed (\\1 etc).",
+    "flags": "Optional list of re flags: IGNORECASE, MULTILINE, DOTALL.",
+    "narrate_persona": "Persona name for narration.",
+    "narrate_template": "Format string. {count} = number of substitutions made."
+  },
+  "repairs": [
+    {
+      "id": "US_CENTER_COORDS",
+      "error_signature": "BROWSER GEOLOCATION INITIALIZATION RULE",
+      "target_file": "index.tsx",
+      "type": "regex_sub",
+      "pattern": "(?<![\\d.])(?:39\\.82(?:83)?|-?98\\.57(?:95)?)(?![\\d])",
+      "replacement": "0",
+      "narrate_persona": "Juniper Ryle",
+      "narrate_template": "RULES REPAIR (deterministic): Stripped {count} hardcoded continental-center coordinate literal(s)."
+    },
+    {
+      "id": "PLASMA_PARSING",
+      "error_signature": "PLASMA PARSING ROBUSTNESS",
+      "target_file": "app.py",
+      "type": "regex_sub",
+      "pattern": "(\\w+)\\[(\\d+)\\]\\s+is\\s+not\\s+None",
+      "replacement": "\\1[\\2] not in ('', None, '-', 'null')",
+      "narrate_persona": "Isaac Moreno",
+      "narrate_template": "RULES REPAIR (deterministic): Hardened {count} row None-check(s) to also exclude empty/sentinel values."
+    },
+    {
+      "id": "FLOAT_EMPTY_STRING_GUARD",
+      "error_signature": "PLASMA PARSING ROBUSTNESS",
+      "target_file": "app.py",
+      "type": "regex_sub",
+      "pattern": "float\\(\\s*(\\w+)\\[(\\d+)\\]\\s*\\)",
+      "replacement": "float(\\1[\\2]) if \\1[\\2] not in ('', None, '-', 'null') else None",
+      "narrate_persona": "Isaac Moreno",
+      "narrate_template": "RULES REPAIR (deterministic): Wrapped {count} float(row[N]) call(s) with empty/sentinel guard."
+    },
+    {
+      "id": "GEOCODING_REGION_PREFIX",
+      "error_signature": "WEATHER CITY GEOCODING RULE",
+      "target_file": "index.tsx",
+      "type": "regex_sub",
+      "pattern": "Region\\s+(?=\\$\\{[^}]*lat)",
+      "replacement": "",
+      "flags": ["IGNORECASE"],
+      "narrate_persona": "Juniper Ryle",
+      "narrate_template": "RULES REPAIR (deterministic): Stripped {count} 'Region ${lat}' fallback prefix(es) from hero — city name must come from geocoding response."
+    },
+    {
+      "id": "BACKEND_EMPTY_PAYLOAD",
+      "error_signature": "BACKEND EMPTY-PAYLOAD GUARD RULE",
+      "target_file": "app.py",
+      "type": "regex_sub",
+      "pattern": "(except[^:]*:\\s*\\n(?:\\s*(?:logger|logging|print|narrate)[^\\n]*\\n)*\\s*)return\\s*(\\{\\s*\\}|\\[\\s*\\])",
+      "replacement": "\\1raise HTTPException(status_code=503, detail={\"error\": \"upstream_unavailable\"})",
+      "flags": ["MULTILINE"],
+      "narrate_persona": "Isaac Moreno",
+      "narrate_template": "RULES REPAIR (deterministic): Replaced {count} bare empty-payload return(s) with HTTPException(503) in except handlers."
+    },
+    {
+      "id": "BACKEND_HTTPEXCEPTION_IMPORT",
+      "error_signature": "BACKEND EMPTY-PAYLOAD GUARD RULE",
+      "target_file": "app.py",
+      "type": "regex_replace_first",
+      "pattern": "^from fastapi import (?!.*\\bHTTPException\\b)([^\\n]+)",
+      "replacement": "from fastapi import HTTPException, \\1",
+      "flags": ["MULTILINE"],
+      "narrate_persona": "Isaac Moreno",
+      "narrate_template": "RULES REPAIR (deterministic): Injected HTTPException into fastapi import so 503 raises compile cleanly."
+    }
+  ]
+}

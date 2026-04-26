@@ -383,6 +383,41 @@ class UnifiedOrchestrator:
             return True
         return False
 
+    def _extract_module_name(self, task_text: str) -> str:
+        """Finds a registered module name mentioned in the task text for scope locking."""
+        try:
+            from core.integration_engine import get_registry
+            registry = get_registry()
+            task_lower = task_text.lower()
+            for mod_name in registry:
+                # Match both underscore form (my_module) and space form (my module)
+                if mod_name.lower() in task_lower or mod_name.lower().replace("_", " ") in task_lower:
+                    return mod_name
+        except Exception:
+            pass
+        return ""
+
+    def _set_task_scope(self, category: str, task_text: str) -> str:
+        """Sets CURRENT_TASK_CATEGORY and CURRENT_MODULE env vars for file guard enforcement.
+        Returns the module name that was locked (empty string if none)."""
+        os.environ["CURRENT_TASK_CATEGORY"] = category
+        if category in ("patch", "repair"):
+            mod_name = self._extract_module_name(task_text)
+            if mod_name:
+                os.environ["CURRENT_MODULE"] = mod_name
+                narrate("Eliza", f"Patch/Repair scope locked to module: '{mod_name}' — writes outside backend/modules/{mod_name}/ are blocked.")
+                return mod_name
+            else:
+                os.environ.pop("CURRENT_MODULE", None)
+        else:
+            os.environ.pop("CURRENT_MODULE", None)
+        return ""
+
+    def _clear_task_scope(self):
+        """Clears task scope env vars after execution completes."""
+        os.environ.pop("CURRENT_TASK_CATEGORY", None)
+        os.environ.pop("CURRENT_MODULE", None)
+
     async def _execute_task_direct(self, text: str, sys_instr: str, category: str, assigned_to: str, orch_data: dict, is_technical: bool, attachments: List[str] = None, session_id: str = "default", user_name: str = "default") -> Dict[str, Any]:
         """Synchronous execution (waits for result)."""
         from memory_system.history_manager import get_history_manager
@@ -391,15 +426,19 @@ class UnifiedOrchestrator:
 
         if is_technical:
             narrate("Eliza", f"Orchestrating technical action for '{text[:100]}...' via {assigned_to}...")
-            result_dict = await call_gemini_with_tools(
-                prompt=text,
-                system_instruction=sys_instr,
-                category=category,
-                persona_name=assigned_to,
-                clear_history=True,
-                attachments=attachments,
-                history=session_history
-            )
+            self._set_task_scope(category, text)
+            try:
+                result_dict = await call_gemini_with_tools(
+                    prompt=text,
+                    system_instruction=sys_instr,
+                    category=category,
+                    persona_name=assigned_to,
+                    clear_history=True,
+                    attachments=attachments,
+                    history=session_history
+                )
+            finally:
+                self._clear_task_scope()
             _user_hist_msg = text.rsplit("CURRENT_USER_INPUT:", 1)[-1].strip() if "CURRENT_USER_INPUT:" in text else text
             history_mgr.add_message("user", _user_hist_msg)
             history_mgr.add_message("assistant", result_dict.get("text", ""), thought_signature=result_dict.get("thought_signature"))
@@ -689,21 +728,27 @@ class UnifiedOrchestrator:
             f"{resources_info}"
         )
 
-        if category == "patch":
+        if category in ("patch", "repair"):
             patch_protocol = (
-                "\n\nPATCH PROTOCOL — TARGETED CHANGE ONLY:\n"
-                "You are making a SMALL, SURGICAL change to an existing module. DO NOT rewrite entire files.\n"
+                "\n\nPATCH/REPAIR PROTOCOL — SURGICAL SCOPE ONLY:\n"
+                "You are making a TARGETED fix to ONE existing module. The file guard is ACTIVE and will BLOCK any write outside that module's folder.\n"
                 "MANDATORY STEPS — follow in order:\n"
-                "1. Use FS_GET_PROJECT_MAP or FS_LIST_DIR to locate the module directory if you are unsure of the path.\n"
-                "2. Use FS_READ_FILE to read the current file you need to change.\n"
-                "3. Identify ONLY the specific lines that need to change based on the user's request.\n"
-                "4. Use FS_WRITE_FILE to save the file with ONLY that targeted change applied — everything else must remain identical.\n"
-                "5. After writing, call RUN_BUILD_SCRIPT with the module_name to rebuild ONLY that single module. DO NOT run a full system build.\n"
-                "CRITICAL RULES:\n"
-                "- DO NOT rewrite the whole file. Surgical precision only.\n"
-                "- DO NOT touch files that are not related to the requested change.\n"
-                "- DO NOT run a full rebuild. Only RUN_BUILD_SCRIPT(module_name=<the specific module>).\n"
-                "- If the change is backend-only (app.py), no rebuild is needed — the server reloads automatically.\n"
+                "1. Use FS_LIST_DIR to confirm the module directory (backend/modules/<module_name>/).\n"
+                "2. Use FS_READ_FILE to read ONLY the specific file(s) that need changing.\n"
+                "3. Identify the EXACT lines to change — nothing else.\n"
+                "4. Use FS_WRITE_FILE to write the file with ONLY that change applied. Everything else must be byte-for-byte identical.\n"
+                "5. If the change affects index.tsx or styles.css: call RUN_BUILD_SCRIPT(module_name=<the module>) to rebuild ONLY that module.\n"
+                "   If the change is app.py only: NO rebuild needed — the server hot-reloads Python automatically.\n"
+                "HARD BOUNDARIES — the file guard WILL REJECT these with a PermissionError:\n"
+                "- ANY write to backend/ core files (llm_router.py, build.py, main.py, orchestrator.py, etc.)\n"
+                "- ANY write to another module's folder\n"
+                "- ANY write to frontend/ node_modules/ or system config files\n"
+                "- Running a full system rebuild (RUN_BUILD_SCRIPT with no module_name)\n"
+                "DO NOT:\n"
+                "- Rewrite the entire file — copy existing content and change only the targeted section\n"
+                "- Delete files or directories\n"
+                "- Add new dependencies or change module.json unless explicitly asked\n"
+                "- Touch .env unless the fix specifically requires a new key\n"
             )
             return f"{base_instr}{patch_protocol}\n\n{REASONING_PROTOCOL}"
 

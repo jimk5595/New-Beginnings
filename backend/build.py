@@ -240,10 +240,18 @@ def build_chat_bubble_html(personas: list) -> str:
     appendMsg('user', text || '(attachment only)', attachments);
     var thinking = appendThinking();
     try {{
+      var pageCtx = '';
+      try {{
+        var pgTitle = document.title || '';
+        var pgUrl = window.location.href || '';
+        var pgText = (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').trim().slice(0, 2000);
+        pageCtx = '[PAGE CONTEXT]\nTitle: ' + pgTitle + '\nURL: ' + pgUrl + '\nVisible Content: ' + pgText + '\n[/PAGE CONTEXT]\n\n';
+      }} catch(e) {{}}
+      var fullMessage = pageCtx + (text || '');
       var resp = await fetch('http://127.0.0.1:8000/api/chat/chat', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{ persona: p.id, message: text, attachments: attachments, session_id: SESSION_ID }})
+        body: JSON.stringify({{ persona: p.id, message: fullMessage, attachments: attachments, session_id: SESSION_ID }})
       }});
       var data = await resp.json();
       thinking.remove();
@@ -295,6 +303,32 @@ def inject_tailwind(html_path: Path):
         print(f"    Injected Tailwind CDN into {html_path.name}")
     except Exception as e:
         print(f"    WARNING: Could not inject Tailwind CDN into {html_path}: {e}")
+
+
+FULLSCREEN_FIX_STYLE = """<style>
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+#root { display: flex; flex-direction: column; width: 100%; height: 100%; }
+#root > * { flex: 1 1 auto; width: 100%; min-height: 0; }
+</style>"""
+
+def inject_fullscreen_fix(html_path: Path):
+    """Ensures the React root and its direct child fill the full viewport.
+    
+    Root cause: AI-generated App root divs use 'flex h-screen' but omit 'w-full'.
+    Since #root is display:flex (row), children only expand in the cross-axis (height),
+    not the main axis (width), leaving a dead zone on the right side of the screen.
+    This injected style overrides that unconditionally for every module.
+    """
+    try:
+        content = html_path.read_text(encoding="utf-8", errors="replace")
+        if "__nb_fullscreen_fix__" in content:
+            return
+        marker = FULLSCREEN_FIX_STYLE.replace("<style>", '<style id="__nb_fullscreen_fix__">')
+        content = content.replace("</head>", f"  {marker}\n</head>")
+        html_path.write_text(content, encoding="utf-8", errors="replace")
+        print(f"    Injected fullscreen fix into {html_path.name}")
+    except Exception as e:
+        print(f"    WARNING: Could not inject fullscreen fix into {html_path}: {e}")
 
 
 def inject_chat_bubble(html_path: Path, personas: list):
@@ -411,6 +445,22 @@ def build_modules(target_module: str = None):
                             except Exception as _del_e:
                                 print(f"    WARNING: Could not delete stale bundle {out_file}: {_del_e}")
                         continue
+                    # Treat esbuild [duplicate-object-key] warnings as BUILD_ERROR.
+                    # A duplicate style={{}} JSX prop silently discards one of the style objects —
+                    # losing height constraints, causing map overflow or invisible containers.
+                    # esbuild exits 0 but emits this warning — we must catch it and fail the build
+                    # so the repair cycle can patch the source rather than silently deploying broken CSS.
+                    _esbuild_stderr = (result.stderr or "") + (result.stdout or "")
+                    if "[duplicate-object-key]" in _esbuild_stderr:
+                        print(f"    esbuild BUILD_ERROR: [duplicate-object-key] warning detected in {module_folder} — duplicate JSX style prop discards one style rule. Treating as build failure.")
+                        failed_modules.append(module_folder)
+                        if out_file.exists():
+                            try:
+                                out_file.unlink()
+                                print(f"    Deleted bundle with duplicate-key defect: {out_file}")
+                            except Exception as _del_e:
+                                print(f"    WARNING: Could not delete defective bundle {out_file}: {_del_e}")
+                        continue
                     elif not out_file.exists():
                         print(f"    esbuild exited 0 but {out_file} was NOT produced for {module_folder}")
                         failed_modules.append(module_folder)
@@ -446,6 +496,7 @@ def build_modules(target_module: str = None):
                         print(f"    Injected styles.css link into index.html")
                 inject_tailwind(html_out)
                 inject_leaflet(html_out)
+                inject_fullscreen_fix(html_out)
                 personas = manifest_modules.get(module_folder, {}).get("personas", [])
                 if personas:
                     print(f"    Injecting chat bubble with {len(personas)} persona(s)...")
@@ -464,6 +515,7 @@ def build_modules(target_module: str = None):
             if html_out.exists():
                 inject_tailwind(html_out)
                 inject_leaflet(html_out)
+                inject_fullscreen_fix(html_out)
                 personas = manifest_modules.get(built_folder.name, {}).get("personas", [])
                 if personas:
                     inject_chat_bubble(html_out, personas)
