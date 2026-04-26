@@ -51,7 +51,7 @@
       "replacement": "",
       "flags": ["IGNORECASE"],
       "narrate_persona": "Juniper Ryle",
-      "narrate_template": "RULES REPAIR (deterministic): Stripped {count} 'Region ${lat}' fallback prefix(es) from hero — city name must come from geocoding response."
+      "narrate_template": "RULES REPAIR (deterministic): Stripped {count} 'Region ${{lat}}' fallback prefix(es) from hero — city name must come from geocoding response."
     },
     {
       "id": "BACKEND_EMPTY_PAYLOAD",

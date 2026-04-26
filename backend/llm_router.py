@@ -4683,7 +4683,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             return await _stage5_render_check_and_complete("is now fully integrated and operational")
         else:
             errors_str = res.get('details', 'Unknown error')
-            _known_pfx = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:)'
+            _known_pfx = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:|DATA_ERROR:|RUNTIME_ERROR:)'
             error_list = [e.strip() for e in re.split(rf';\s*(?={_known_pfx})', errors_str) if e.strip()]
             skeleton_errors = [e for e in error_list if e.startswith("SKELETON:") and not e.startswith("SKELETON_VIEW:")]
             view_skeleton_errors = [e for e in error_list if e.startswith("SKELETON_VIEW:")]
@@ -5725,7 +5725,10 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             merged_blob[_tgt] = _new_blob
                         _lui_changed = True
                         _persona = _entry.get("narrate_persona", "Juniper Ryle")
-                        _msg = _entry.get("narrate_template", "RULES REPAIR (registry): Applied {count} fix(es).").format(count=_n)
+                        try:
+                            _msg = _entry.get("narrate_template", "RULES REPAIR (registry): Applied {count} fix(es).").format(count=_n)
+                        except KeyError as _fmt_err:
+                            _msg = f"RULES REPAIR (registry): Applied {_n} fix(es) [{_entry.get('id', '?')}]. (template key error: {_fmt_err})"
                         narrate(_persona, _msg)
                         for _e in _matching:
                             if _e in rules_errors:
@@ -5957,7 +5960,11 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     _prec_errors = [e for e in rules_errors if "AUTO-LOAD MANDATE" in e]
                     _prec_route = None
                     for _pe_txt in _prec_errors:
+                        # Pattern 1: tsx_autoload errors — "`/path` is fetched ONLY"
                         _prm = re.search(r"`(/[^`]+)`\s+is fetched ONLY", _pe_txt)
+                        if not _prm:
+                            # Pattern 2: presence_guard errors — "fetch `/path`" or "fetch `/path?..."
+                            _prm = re.search(r"fetch\s+`(/[^?`\s]+)", _pe_txt)
                         if _prm:
                             _prec_route = _prm.group(1)
                             break
