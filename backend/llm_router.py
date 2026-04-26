@@ -877,7 +877,17 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
         except:
             pass
 
-        marcus_system_instruction = f"{system_instruction}\n\n{BUILD_INSTRUCTIONS}\n\n{REASONING_PROTOCOL}"
+        # Strip the full PLATFORM RULES block that the orchestrator injects into system_instruction.
+        # The build engine already extracts targeted rule sections per file via _get_mandate() and
+        # per-domain via _get_module_rules() — having the full 40k rules.md in the system prompt
+        # on every LLM call wastes ~880k input tokens per 7-domain build (~$60+).
+        # The persona identity / platform context lines above the rules block are kept intact.
+        _sys_stripped = re.sub(
+            r'\n*### PLATFORM RULES ###\n[\s\S]*?(?=\n###\s[A-Z]|\Z)',
+            '',
+            system_instruction
+        ).strip()
+        marcus_system_instruction = f"{_sys_stripped}\n\n{BUILD_INSTRUCTIONS}\n\n{REASONING_PROTOCOL}"
 
         plan_prompt = (
             f"TASK: {prompt}\n\n"
@@ -955,6 +965,11 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
 
         # Small files only get a compact plan summary to save input tokens
         NEEDS_FULL_PLAN = {"app.py", "index.tsx"}
+
+        # Structured/templated files that don't need pro-preview intelligence.
+        # module.json is a small JSON envelope; index.html is a 30-line shell; styles.css
+        # is a mechanical CSS listing. Flash-lite is 20x cheaper and fully sufficient.
+        _CHEAP_FILES = {"module.json", "index.html", "styles.css"}
 
         # STAGE 2: FILE GENERATION (.env already done above — skip it)
         # Extract views to decide if we use Domain-Based Assembly (Incremental Build)
@@ -1222,8 +1237,11 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         + "\nWrite a complete, real CSS rule for each class listed above.\n"
                     )
 
+            # Cap context injected per file — cheap/structured files need only a short excerpt.
+            # Full prompt is 3-5k chars; capping it saves ~3k tokens × every file call.
+            _prompt_ctx = prompt[:800] if filename in _CHEAP_FILES else prompt[:1500]
             file_prompt = (
-                f"CONTEXT: {prompt}\n"
+                f"CONTEXT: {_prompt_ctx}\n"
                 f"ARCHITECTURE PLAN: {plan_ctx}\n"
                 f"{extra_ctx}"
                 f"FILE_TO_GENERATE: {filename}\n"
@@ -1231,7 +1249,13 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                 f"Return ONLY the raw content for {filename}. NO markdown code blocks, NO preamble, NO postamble. High-fidelity only."
             )
             max_tok = FILE_MAX_TOKENS.get(filename, 8192)
-            content_res = await call_llm_async(target_model, file_prompt, system_instruction=marcus_system_instruction, max_tokens=max_tok, persona_name=persona, history=None, blocked_models=BUILD_BLOCKED_MODELS, disable_search=True)
+            # Use flash-lite for structured/templated files — 20x cheaper, fully sufficient.
+            # BUILD_BLOCKED_MODELS blocks flash-lite for complex code generation, but these
+            # files are simple JSON envelopes / HTML shells / CSS lists — not code. Pass
+            # blocked_models=[] so flash-lite is used directly without fallback override.
+            _file_model = config.GEMINI_MODEL_31_FLASH_LITE if filename in _CHEAP_FILES else target_model
+            _file_blocked = [] if filename in _CHEAP_FILES else BUILD_BLOCKED_MODELS
+            content_res = await call_llm_async(_file_model, file_prompt, system_instruction=marcus_system_instruction, max_tokens=max_tok, persona_name=persona, history=None, blocked_models=_file_blocked, disable_search=True)
             content = content_res.get("text", "").strip()
             
             # Strip markdown fences unconditionally — LLMs often wrap output in ``` blocks
@@ -1263,7 +1287,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     json.loads(content)
                 except Exception:
                     narrate(persona, f"WARNING: {filename} is invalid JSON after stripping. Retrying generation...")
-                    retry_res = await call_llm_async(target_model, file_prompt, system_instruction=marcus_system_instruction, max_tokens=4096, persona_name=persona, history=None, blocked_models=BUILD_BLOCKED_MODELS, disable_search=True)
+                    retry_res = await call_llm_async(_file_model, file_prompt, system_instruction=marcus_system_instruction, max_tokens=4096, persona_name=persona, history=None, blocked_models=_file_blocked, disable_search=True)
                     retry_content = retry_res.get("text", "").strip()
                     if retry_content.startswith("```"):
                         retry_content = re.sub(r'^```(?:[\w]*)?\n?', '', retry_content)
@@ -3151,10 +3175,10 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                 f"Return ONLY raw CSS content. NO markdown fences, NO preamble, NO postamble."
             )
             _da_sres = await call_llm_async(
-                target_model, _da_styles_prompt,
+                config.GEMINI_MODEL_31_FLASH_LITE, _da_styles_prompt,
                 system_instruction=marcus_system_instruction,
                 max_tokens=16384, persona_name="Juniper Ryle",
-                history=None, blocked_models=BUILD_BLOCKED_MODELS,
+                history=None, blocked_models=[],
                 disable_search=True
             )
             _da_css = _da_sres.get("text", "").strip()
