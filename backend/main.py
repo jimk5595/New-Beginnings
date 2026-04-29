@@ -167,6 +167,18 @@ async def lifespan(app: FastAPI):
     
     repair_orchestrator.on_refresh_callback = reload_callback
 
+    # Install global asyncio exception handler to prevent unhandled background task
+    # exceptions (e.g. from module API routes making long Gemini calls during render
+    # checks) from propagating to the event loop and crashing the entire server.
+    def _nb_async_exception_handler(loop, context):
+        exc = context.get("exception")
+        msg = context.get("message", "unhandled async exception")
+        logger.error(f"[AsyncGuard] Caught unhandled background exception — server protected: {msg} | {exc}")
+    try:
+        asyncio.get_event_loop().set_exception_handler(_nb_async_exception_handler)
+    except Exception:
+        pass
+
     # Restore persistent daemons now that the event loop is running
     try:
         from core.orchestrator import unified_orchestrator

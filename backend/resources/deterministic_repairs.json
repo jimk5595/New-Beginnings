@@ -74,6 +74,58 @@
       "flags": ["MULTILINE"],
       "narrate_persona": "Isaac Moreno",
       "narrate_template": "RULES REPAIR (deterministic): Injected HTTPException into fastapi import so 503 raises compile cleanly."
+    },
+    {
+      "id": "FIRMS_WORLD_URL",
+      "error_signature": "FIRMS URL MANDATE",
+      "target_file": "app.py",
+      "type": "regex_sub",
+      "pattern": "(firms\\.modaps\\.eosdis\\.nasa\\.gov/api/country/csv/[^/]+/VIIRS_SNPP_NRT/)(?!world)[A-Za-z]+(/\\d+)",
+      "replacement": "\\1world\\2",
+      "flags": ["IGNORECASE"],
+      "narrate_persona": "Isaac Moreno",
+      "narrate_template": "RULES REPAIR (deterministic): Replaced {count} FIRMS country-specific code(s) with `world` — all global wildfires now visible."
+    },
+    {
+      "id": "NULLISH_COALESCING_OR_PRECEDENCE",
+      "error_signature": "NULLISH COALESCING OR PRECEDENCE",
+      "target_file": "index.tsx",
+      "type": "regex_sub",
+      "pattern": "([\\w$][\\w$.]*(?:\\?\\.[\\w$]+)*(?:\\[[^\\]]+\\])*(?:\\.[\\w$]+)*)(\\s*\\?\\?\\s*(?:\\d+(?:\\.\\d+)?|'[^']*'|\"[^\"]*\"|`[^`]*`|\\b(?:null|undefined|false|true)\\b|[\\w$][\\w$.]*(?:\\?\\.[\\w$]+)*(?:\\[[^\\]]+\\])*(?:\\.[\\w$]+)*))(\\s*\\|\\|)",
+      "replacement": "(\\1\\2)\\3",
+      "flags": ["DOTALL"],
+      "narrate_persona": "Juniper Ryle",
+      "narrate_template": "RULES REPAIR (deterministic): Parenthesized {count} `?? value ||` operator-precedence expression(s) — prevents esbuild syntax error."
+    },
+    {
+      "id": "OCEAN_SST_TILE_NOLABELS",
+      "error_signature": "OCEAN SST TILE VISIBILITY MANDATE",
+      "target_file": "index.tsx",
+      "type": "regex_sub",
+      "pattern": "(?:dark_nolabels|light_nolabels)",
+      "replacement": "dark_only_labels",
+      "narrate_persona": "Juniper Ryle",
+      "narrate_template": "RULES REPAIR (deterministic): Replaced {count} `dark_nolabels`/`light_nolabels` CartoDB tile layer URL(s) with `dark_only_labels` — fixes SST color gradient visibility over ocean."
+    },
+    {
+      "id": "ERROR_BOUNDARY_HEADING",
+      "error_signature": "ERROR BOUNDARY NAMING CONVENTION RULE",
+      "target_file": "index.tsx",
+      "type": "regex_sub",
+      "pattern": "(?:View Render Failure|View Crashed|Module Rendering Error|\\bView Error\\b)",
+      "replacement": "Module View Error",
+      "narrate_persona": "Juniper Ryle",
+      "narrate_template": "RULES REPAIR (deterministic): Replaced {count} non-canonical ErrorBoundary heading(s) with 'Module View Error'."
+    },
+    {
+      "id": "ERROR_BOUNDARY_RETRY_LABEL",
+      "error_signature": "ERROR BOUNDARY NAMING CONVENTION RULE",
+      "target_file": "index.tsx",
+      "type": "regex_sub",
+      "pattern": "(?:Attempt Recovery|Retry View Initialization)",
+      "replacement": "Retry",
+      "narrate_persona": "Juniper Ryle",
+      "narrate_template": "RULES REPAIR (deterministic): Replaced {count} non-canonical ErrorBoundary retry label(s) with 'Retry'."
     }
   ]
 }

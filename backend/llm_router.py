@@ -25,6 +25,256 @@ def stop_all_builds():
     _BUILD_STOPPED = True
 
 
+# ---------------------------------------------------------------------------
+# Module-level repair helpers — called from multiple repair passes so they
+# live here rather than being re-defined inline in the build handler.
+# ---------------------------------------------------------------------------
+
+_NC_COALESCING_RE = re.compile(
+    r'([\w$][\w$.]*'
+    r'(?:\?\.[\w$]+)*'
+    r'(?:\[[^\]]+\])*'
+    r'(?:\.[\w$]+)*)'
+    r'(\s*\?\?\s*'
+    r'(?:\d+(?:\.\d+)?'
+    r'|\'[^\']*\''
+    r'|"[^"]*"'
+    r'|`[^`]*`'
+    r'|\bnull\b|\bundefined\b|\bfalse\b|\btrue\b'
+    r'|[\w$][\w$.]*(?:\?\.[\w$]+)*(?:\[[^\]]+\])*(?:\.[\w$]+)*'
+    r'))'
+    r'(\s*\|\|)',
+    re.DOTALL,
+)
+
+
+def _fix_nullish_coalescing(tsx: str) -> str:
+    """
+    Parenthesize every `val ?? rhs ||` expression so esbuild does not reject
+    the file with 'Cannot use ?? with || without parentheses'.
+    Two-pass strategy:
+      Pass 1: regex handles the common simple-literal/identifier RHS patterns.
+      Pass 2: scanner-based pass handles function calls and more complex RHS.
+    Safe to call multiple times — already-parenthesized chains are not re-wrapped
+    because the LHS regex requires a word-char start, not '('.
+    """
+    result = _NC_COALESCING_RE.sub(r'(\1\2)\3', tsx)
+
+    # Pass 2 — scanner: find `?? expr ||` where expr contains () or []
+    # Walk the string character by character tracking string/paren depth.
+    # When we see `??` outside any string/template, record LHS end position.
+    # Then advance past the RHS (tracking nesting), and if the next non-space
+    # token is `||` or `&&`, wrap from the start of LHS to end of RHS.
+    out = []
+    i = 0
+    n = len(result)
+    in_sq = False
+    in_dq = False
+    in_tpl = 0
+    in_bc = False
+    while i < n:
+        ch = result[i]
+        if in_bc:
+            if result[i:i+2] == '*/':
+                in_bc = False
+                out.append('*/')
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+            continue
+        if not (in_sq or in_dq or in_tpl):
+            if result[i:i+2] == '//':
+                eol = result.find('\n', i)
+                seg = result[i:] if eol < 0 else result[i:eol]
+                out.append(seg)
+                i += len(seg)
+                continue
+            if result[i:i+2] == '/*':
+                in_bc = True
+                out.append('/*')
+                i += 2
+                continue
+            if result[i:i+2] == '??' and (not out or out[-1][-1:] not in ('(', '[')):
+                # Found `??` outside strings. Find LHS start by scanning backward
+                # through already-emitted chars to find the start of the LHS expr.
+                emitted = ''.join(out)
+                # Strip trailing whitespace to find end of LHS
+                lhs_end = len(emitted.rstrip())
+                lhs_str = emitted[:lhs_end]
+                # Find LHS start: walk back through word chars, dots, brackets
+                j = len(lhs_str) - 1
+                depth = 0
+                while j >= 0:
+                    c2 = lhs_str[j]
+                    if c2 in (']', ')'):
+                        depth += 1
+                    elif c2 in ('[', '('):
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif depth == 0 and c2 not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$?.':
+                        j += 1
+                        break
+                    j -= 1
+                lhs_start = max(0, j)
+                lhs_token = lhs_str[lhs_start:]
+                # Skip past `?? ` and find RHS end (tracking nesting)
+                rhs_start = i + 2
+                k = rhs_start
+                depth2 = 0
+                in_sq2 = in_dq2 = False
+                in_tpl2 = 0
+                while k < n:
+                    c3 = result[k]
+                    if in_sq2:
+                        if c3 == '\\':
+                            k += 2
+                            continue
+                        if c3 == "'":
+                            in_sq2 = False
+                    elif in_dq2:
+                        if c3 == '\\':
+                            k += 2
+                            continue
+                        if c3 == '"':
+                            in_dq2 = False
+                    elif in_tpl2:
+                        if c3 == '`':
+                            in_tpl2 -= 1
+                    else:
+                        if c3 == "'":
+                            in_sq2 = True
+                        elif c3 == '"':
+                            in_dq2 = True
+                        elif c3 == '`':
+                            in_tpl2 += 1
+                        elif c3 in ('(', '[', '{'):
+                            depth2 += 1
+                        elif c3 in (')', ']', '}'):
+                            if depth2 == 0:
+                                break
+                            depth2 -= 1
+                        elif depth2 == 0:
+                            # Check if we hit || or && — that's where we stop
+                            if result[k:k+2] in ('||', '&&'):
+                                break
+                            # Also stop at newline-level terminators
+                            if c3 in (';', ',') and depth2 == 0:
+                                break
+                    k += 1
+                rhs_token = result[rhs_start:k].strip()
+                rest_check = result[k:k+2].strip()
+                if rest_check in ('||', '&&') and lhs_token and rhs_token:
+                    # Check it's not already parenthesized (lhs starts with word)
+                    if lhs_token[0:1] not in ('(', '[', "'", '"', '`'):
+                        # Rewrite: replace end of emitted + inject wrap
+                        out2 = emitted[:lhs_start]
+                        out.clear()
+                        out.append(out2)
+                        out.append(f'({lhs_token} ?? {rhs_token})')
+                        i = k  # continue from the || / &&
+                        continue
+        # Normal character tracking
+        if ch == '\\' and (in_sq or in_dq):
+            out.append(ch)
+            i += 1
+            if i < n:
+                out.append(result[i])
+                i += 1
+            continue
+        if ch == '`':
+            in_tpl = in_tpl + 1 if not in_tpl else in_tpl - 1
+        elif not in_tpl:
+            if ch == "'" and not in_dq:
+                in_sq = not in_sq
+            elif ch == '"' and not in_sq:
+                in_dq = not in_dq
+        out.append(ch)
+        i += 1
+    return ''.join(out) if ''.join(out) != result else result
+
+
+def _fix_unterminated_strings(tsx: str) -> tuple:
+    """
+    Comprehensive scan-and-close pass for unterminated single/double-quoted
+    string literals in TSX.  Carries block-comment and template-literal state
+    across lines so lines inside multi-line backtick strings are never falsely
+    patched.  Returns (fixed_tsx, count_fixed).
+    """
+    lines = tsx.splitlines(keepends=True)
+    count = 0
+    in_block_comment = False
+    qt_carry = False
+    for i, line in enumerate(lines):
+        qs = False
+        qd = False
+        qt = qt_carry
+        lqcol = -1
+        lqch = None
+        ci = 0
+        while ci < len(line):
+            ch = line[ci]
+            if in_block_comment:
+                if line[ci:ci + 2] == '*/':
+                    in_block_comment = False
+                    ci += 2
+                else:
+                    ci += 1
+                continue
+            if not (qs or qd or qt):
+                if line[ci:ci + 2] == '//':
+                    break
+                if line[ci:ci + 2] == '/*':
+                    in_block_comment = True
+                    ci += 2
+                    continue
+            if ch == '\\' and (qs or qd):
+                ci += 2
+                continue
+            if ch == '`':
+                qt = not qt
+            elif not qt:
+                if ch == "'" and not qd:
+                    qs = not qs
+                    if qs:
+                        lqcol = ci
+                        lqch = "'"
+                elif ch == '"' and not qs:
+                    qd = not qd
+                    if qd:
+                        lqcol = ci
+                        lqch = '"'
+            ci += 1
+        qt_carry = qt
+        if (qs or qd) and lqch and lqcol >= 0:
+            jsx_text_apos = False
+            if lqch == "'":
+                for jxt_i in range(lqcol - 1, -1, -1):
+                    jxt_ch = line[jxt_i]
+                    if jxt_ch == '>':
+                        jsx_text_apos = True
+                        break
+                    if jxt_ch in ('{', '<', '(', '"', '='):
+                        break
+            if jsx_text_apos:
+                continue
+            stripped = line.rstrip('\r\n')
+            has_split = bool(re.search(r'\.split\(\s*$', stripped[:lqcol]))
+            before_quote = stripped[:lqcol]
+            last_lt = before_quote.rfind('<')
+            last_gt = before_quote.rfind('>')
+            in_jsx_attr = last_lt >= 0 and last_lt > last_gt
+            if in_jsx_attr:
+                lines[i] = stripped + lqch + '/>\n'
+            elif has_split:
+                lines[i] = stripped + lqch + ')\n'
+            else:
+                lines[i] = stripped + lqch + '\n'
+            count += 1
+    return ''.join(lines), count
+
+
 def _iter_jsx_input_tags(tsx_src: str):
     """
     Yield (tag_body, close_str, start_pos, end_pos) for every <input> or <input/>
@@ -887,7 +1137,33 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             '',
             system_instruction
         ).strip()
-        marcus_system_instruction = f"{_sys_stripped}\n\n{BUILD_INSTRUCTIONS}\n\n{REASONING_PROTOCOL}"
+        _COMPONENT_RULES = (
+            "\n\n### COMPONENT GENERATION RULES (apply to every domain component) ###\n"
+            "TIMESTAMP RULE (RULE 27): The backend PRE-FORMATS all timestamps before returning them.\n"
+            "  - hourly `time` field -> already '07:00 AM'. Render directly: {hour.time}. NEVER call new Date(hour.time).\n"
+            "  - daily `date` field -> already 'Tuesday, Apr 15'. Render directly: {day.date}. NEVER call new Date(day.date).\n"
+            "  - Fields typed str_HH_MM_AM or str_day_mon_date in the Returns contract -> strings, render as-is.\n"
+            "  - Fields typed int_unix_ms -> use new Date(value). Fields typed int_unix_s -> use new Date(value * 1000).\n"
+            "FIELD NAMES RULE: Use ONLY the exact field names from the Routes context. Never guess raw API field names.\n"
+            "ARRAY SAFETY RULE: Guard every array with (Array.isArray(data) ? data : []).map(...). "
+            "NEVER use (data ?? []).map(...) — ?? passes objects through and causes '.map is not a function' crashes.\n"
+            "MAP HEIGHT RULE: All Leaflet map container divs MUST have explicit inline height: "
+            "style={{height: '480px', width: '100%'}}. CSS classes alone are unreliable.\n"
+            "SCROLL CONFLICT RULE: For canvas interactive views use "
+            "canvasRef.current?.addEventListener('wheel', handler, {passive: false}) inside useEffect — "
+            "NEVER use React onWheel prop (registered as passive, e.preventDefault() is ignored).\n"
+            "CANVAS VIRTUAL SPACE RULE: Canvas pan+zoom views MUST generate elements in virtual space >= 8x canvas size. "
+            "Zoom handler MUST use multiplicative factor: setZoom(z => Math.max(0.1, Math.min(3, z * (e.deltaY < 0 ? 1.1 : 0.9)))).\n"
+            "LEAFLET GLOBAL RULE: Use L.map(), L.tileLayer(), L.circleMarker() directly. "
+            "NEVER use declare var L, window.L, or import L from 'leaflet' (default import). "
+            "The assembly pipeline injects import * as L from 'leaflet' automatically.\n"
+            "FULL-WIDTH LAYOUT RULE: Root component div MUST be full-width. NEVER apply max-w-* Tailwind classes "
+            "to the outermost container. Use w-full or no width class on the root div.\n"
+            "CITY SEARCH RULE: If the view has a city/location search input, the primary fetch function MUST be "
+            "defined with React.useCallback at the top level (NOT inside a useEffect body), accept lat/lon params, "
+            "and be called immediately from useEffect on mount AND from the geocode search handler.\n"
+        )
+        marcus_system_instruction = f"{_sys_stripped}\n\n{BUILD_INSTRUCTIONS}\n\n{REASONING_PROTOCOL}{_COMPONENT_RULES}"
 
         plan_prompt = (
             f"TASK: {prompt}\n\n"
@@ -1080,7 +1356,9 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             app_skel_mandate = (
                 f"{_get_mandate('app.py')}\n\n"
                 f"SKELETON MODE: Generate ONLY the base framework for app.py.\n"
-                f"Include: all mandatory imports, `router = APIRouter()`, and the complete `register(router)` function.\n"
+                f"Include: all mandatory imports, `import os`, `router = APIRouter()`, and the complete "
+                f"`def register():` function (zero arguments) that simply returns `router`.\n"
+                f"CRITICAL CONTRACT: The function signature MUST be exactly `def register():` — no parameters.\n"
                 f"DO NOT add any domain-specific route functions yet.\n"
                 f"Place the comment `# DOMAIN ROUTES START HERE` on its own line just before the `register` function "
                 f"as the insertion point for domain routes that will be added later."
@@ -1699,6 +1977,19 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         narrate(persona, "AUTO-FIX: Replaced all window.L / (window as any).L references with L (Leaflet npm import).")
                     merged_blob["index.tsx"] = content
 
+                # Fix 6: L.Map() class constructor requires 'new'.
+                # LLMs write `L.Map(container, opts)` treating it like a factory, but L.Map is an
+                # ES6 class. Calling it without `new` throws "Constructor Map requires 'new'" at
+                # runtime. L.map() (lowercase) IS the factory; L.Map() (uppercase) is the class.
+                # Replace ALL L.Map( with new L.Map(, then collapse any doubled `new new L.Map(`.
+                if 'L.Map(' in content:
+                    _lmap_ctor_before = content
+                    content = re.sub(r'\bL\.Map\s*\(', 'new L.Map(', content)
+                    content = re.sub(r'\bnew\s+new\s+L\.Map\s*\(', 'new L.Map(', content)
+                    if content != _lmap_ctor_before:
+                        narrate(persona, "AUTO-FIX: Added 'new' before L.Map() — Leaflet Map class constructor requires 'new' (prevents 'Constructor Map requires new' crash).")
+                        merged_blob["index.tsx"] = content
+
                 # Fix 7: Leaflet container existence guard.
                 # LLMs generate useEffect hooks that call L.map('container-id'), but when
                 # the component has a loading guard (early return before the JSX), the
@@ -2215,29 +2506,12 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     f"- Component MUST render real live data from the API — NOT static text, NOT placeholders.\n"
                     f"- Use useState for all data state. Access response fields by their EXACT names from the Routes context.\n"
                     f"- Data fields from backend MUST be accessed directly (e.g. data.temperature, NOT data.current.temperature).\n"
-                    f"- CRITICAL TIMESTAMP RULES:\n"
-                    f"  RULE 27 MANDATE — Our backend PRE-FORMATS all timestamps before returning them. This means:\n"
-                    f"  - hourly `time` field → already a human-readable string like '07:00 AM'. Render it directly: `{{hour.time}}`. NEVER call `new Date(hour.time)` or `new Date(hour.time * 1000)` — this gives 'Invalid Date'.\n"
-                    f"  - daily `date` field → already a human-readable string like 'Tuesday, Apr 15'. Render it directly: `{{day.date}}`. NEVER call `new Date(day.date)` or `new Date(day.date * 1000)` — this gives 'Invalid Date'.\n"
-                    f"  - Any field typed as `str_HH_MM_AM` in the contract (e.g. a time-of-day field) → already a formatted string like '6:15 AM'. Render directly — do NOT pass to `new Date()`.\n"
-                    f"  - If the Routes contract shows a field typed as `str_HH_MM_AM`, `str_day_mon_date`, or `str_ISO` — it is ALREADY a string. Render it as-is.\n"
-                    f"  - If the Routes contract shows a field typed as `int_unix_ms` (milliseconds) — use `new Date(value)` directly (no multiplication).\n"
-                    f"  - If the Routes contract shows a field typed as `int_unix_s` (seconds) — use `new Date(value * 1000)`.\n"
-                    f"  GOLDEN RULE: Check the Routes contract type annotation. Pre-formatted string → render directly. Unix int → use new Date() with appropriate multiplier.\n"
-                    f"- CRITICAL FIELD NAMES: Use ONLY the exact field names listed in the 'Routes context' above. If a route returns `{{items: [{{time, value, label, score}}]}}` then use `item.time` and `item.score` — NEVER guess raw API field names. The field names in the Routes contract are authoritative — any field not listed in the contract does not exist in the response.\n"
-                    f"- CRITICAL ARRAY SAFETY: API responses may return objects, not arrays. NEVER use `(data ?? []).map(...)`. ALWAYS guard with `(Array.isArray(data) ? data : []).map(...)`. The `??` operator only replaces null/undefined — it passes objects through, causing '.map is not a function' crashes.\n"
-                    f"- CRITICAL MAP HEIGHT: All Leaflet map container divs MUST have explicit inline height or the map renders as a zero-height black box. Always write: `<div ref={{mapRef}} style={{{{height: '480px', width: '100%'}}}}></div>`. CSS classes alone are NOT reliable — use inline style.\n"
                     f"- CRITICAL MAP INITIALIZATION — USE CALLBACK REF PATTERN: NEVER initialize a Leaflet map inside a `useEffect(() => {{...}}, [])` with empty deps. If the map container `<div>` is inside ANY conditional (`{{data && (...)}}`, `{{!loading && (...)}}`, etc.), the empty-dep effect fires on mount when the div is still null — and the map NEVER initializes because React won't re-run a `[]`-dep effect. The ONLY safe pattern is the CALLBACK REF which fires whenever the DOM element actually mounts: `const mapCallbackRef = React.useCallback((node: HTMLDivElement | null) => {{ if (!node || mapInstanceRef.current) return; mapInstanceRef.current = L.map(node, {{ scrollWheelZoom: false }}); L.tileLayer('https://{{{{s}}}}.basemaps.cartocdn.com/dark_all/{{{{z}}}}/{{{{x}}}}/{{{{y}}}}{{{{r}}}}.png', {{attribution:'© OpenStreetMap contributors © CARTO',subdomains:'abcd',maxZoom:20}}).addTo(mapInstanceRef.current); setTimeout(() => mapInstanceRef.current?.invalidateSize(), 150); }}, []); ... <div ref={{mapCallbackRef}} style={{{{height:'480px',width:'100%'}}}}></div>`. This callback fires the moment the div enters the DOM — works even when the div is inside a conditional render branch. NEVER use `const mapRef = React.useRef(null)` with a `useEffect(..., [])` for map init.\n"
                     f"- CRITICAL MAP CONDITIONAL RENDER BUG: The `{{data && (...)}}` pattern that wraps the ENTIRE content section of a view is FORBIDDEN when that section contains Leaflet maps. If you use `{{currentData && (<div>...map here...</div>)}}`, the map div is absent from the DOM during initial render, the init effect finds null, and the map never shows. Two rules: (1) Use the callback ref pattern (above) so initialization happens when the div mounts, regardless of conditional timing. (2) Always render map containers unconditionally — use absolute-positioned overlays for loading states. Pattern: `<div style={{{{position:'relative'}}}}><div ref={{mapCallbackRef}} style={{{{height:'480px',width:'100%'}}}}></div>{{loading && <div style={{{{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center',background:'rgba(0,0,0,0.6)',zIndex:10}}}}><span>Loading...</span></div>}}</div>`.\n"
-                    f"- CRITICAL SCROLL CONFLICT: For canvas-based interactive views, use `canvasRef.current?.addEventListener('wheel', handler, {{passive: false}})` inside useEffect — NEVER use React's `onWheel` prop (React registers it as passive, so e.preventDefault() is ignored and the page still scrolls).\n"
-                    f"- CANVAS VIRTUAL SPACE MANDATE: Canvas-based views with pan+zoom using ctx.translate()+ctx.scale() MUST generate background elements in a virtual coordinate space AT LEAST 8× the canvas pixel size. For a ~1000px canvas, use x/y in range ±8000. At zoom=1 the visible window covers ±500 virtual units; at zoom=0.5 it covers ±1000 units — if elements only span ±1500 they cluster in the center at low zoom instead of filling the viewport. The wheel zoom handler MUST use a multiplicative factor so zooming out always reveals MORE content: `setZoom(z => Math.max(0.1, Math.min(3, z * (e.deltaY < 0 ? 1.1 : 0.9))))`. NEVER use additive `z - e.deltaY * 0.002` which produces zoom=0 collapse. Background elements must be generated in a large enough virtual field that at minimum zoom (0.1) the canvas still shows content across its entire surface.\n"
-                    f"- CRITICAL LEAFLET: Leaflet is bundled via npm and available as the global identifier `L` in the assembled file. Use `L.map(...)`, `L.tileLayer(...)`, `L.circleMarker(...)` etc. directly. NEVER use `declare var L: any;` — this is a TypeScript type stub with no runtime effect. NEVER use `window.L`. The assembly pipeline injects `import * as L from 'leaflet'` automatically.\n"
-                    f"- CRITICAL FULL-WIDTH LAYOUT: The root element of the component MUST fill the full available width. NEVER apply `max-w-7xl`, `max-w-6xl`, `max-w-5xl`, `max-w-4xl`, `max-w-3xl`, or any other Tailwind max-width constraint to the outermost container div. The component is already placed inside a routed page — adding a max-width wrapper causes the page to render at 2/3 or 3/4 screen width with wasted dark space on the sides. Use `w-full` or no width class on the root div. Inner content sections (cards, grids, panels) MAY use max-width or padding for readability, but the root container MUST be full-width.\n"
                     f"{_module_rules_comp_str}"
                     f"- Output ONLY: const {comp_name}: React.FC = () => {{ ... }};\n"
                     f"- NO import statements, NO export statements, NO other components.\n"
                     f"- CRITICAL: Do NOT define ANY function or constant whose name ends in 'View' except {comp_name}. Helper functions must use camelCase names that do NOT end in 'View' (e.g., formatData, renderCard, fetchItems — NOT resetView, backView, closeView).\n"
-                    f"- CRITICAL CITY SEARCH MANDATE: If the view includes a city/location search input that geocodes a city name and re-fetches data for the resolved location: the primary data fetch function MUST be defined using `React.useCallback` at the TOP LEVEL of the component (NOT inside a useEffect body). The fetch function must accept lat/lon parameters. Then: (1) call it from a `React.useEffect(() => {{ fetchData(defaultLat, defaultLon); }}, [fetchData])` on mount, and (2) geocode the city via Nominatim in the search handler and IMMEDIATELY call `fetchData(lat, lon)` with the resolved coordinates — do NOT leave the search result unused. A search handler that fetches coordinates but never calls `fetchData(lat, lon)` is broken and will be rejected.\n"
                     f"- CRITICAL: Your component MUST end with `}};` on its own line as the VERY LAST LINE. Every opening `{{` MUST have a matching closing `}}`. An unclosed brace will cascade and break every component that follows.\n"
                     f"- CRITICAL: Do NOT truncate. The response must be COMPLETE. If you are approaching your output limit, simplify the JSX but do NOT cut off mid-function.\n"
                     f"Return ONLY the component function definition. Last character of response must be `}}`."
@@ -2355,9 +2629,17 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                 c_text = _retry_c_text
                                 narrate("Juniper Ryle", f"DOMAIN [{v_idx+1}/{len(extracted_views)}]: Retry SUCCEEDED for '{view_name}' ({len(c_text)} chars). Proceeding with merge.")
                             else:
-                                narrate("Juniper Ryle", f"DOMAIN [{v_idx+1}/{len(extracted_views)}]: Retry still truncated for '{view_name}'. Skipping merge.")
-                                await asyncio.sleep(0.3)
-                                continue
+                                # Retry also truncated — prefer first attempt over an empty skeleton
+                                # if it's substantial (>=3000 chars). Brace-balance auto-close below
+                                # will handle any unclosed braces. An incomplete-but-real component
+                                # is far better than the stub that remains when we skip the merge.
+                                if c_text and len(c_text) >= 3000:
+                                    narrate("Juniper Ryle", f"DOMAIN [{v_idx+1}/{len(extracted_views)}]: Retry still truncated for '{view_name}'. Using first attempt ({len(c_text)} chars) with auto-close rather than leaving skeleton.")
+                                    # fall through to brace-balance and merge
+                                else:
+                                    narrate("Juniper Ryle", f"DOMAIN [{v_idx+1}/{len(extracted_views)}]: Retry still truncated for '{view_name}' and first attempt too small. Skipping merge.")
+                                    await asyncio.sleep(0.3)
+                                    continue
                         else:
                             narrate("Juniper Ryle", f"DOMAIN [{v_idx+1}/{len(extracted_views)}]: Retry returned empty/too-small response for '{view_name}'. Skipping merge.")
                             await asyncio.sleep(0.3)
@@ -2647,7 +2929,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     'render(){'
                     'if(this.state.hasError)return('
                     '<div style={{padding:"16px",margin:"8px",background:"rgba(127,29,29,0.2)",border:"1px solid rgba(239,68,68,0.4)",borderRadius:"8px",color:"#f87171",fontSize:"13px"}}>'
-                    '<p style={{fontWeight:600,marginBottom:"4px"}}>View Error</p>'
+                    '<p style={{fontWeight:600,marginBottom:"4px"}}>Module View Error</p>'
                     '<p style={{fontFamily:"monospace",opacity:0.8,fontSize:"11px"}}>{this.state.error}</p>'
                     '<button onClick={()=>this.setState({hasError:false,error:""})} '
                     'style={{marginTop:"8px",fontSize:"11px",textDecoration:"underline",opacity:0.6,cursor:"pointer",background:"none",border:"none",color:"inherit"}}>Retry</button>'
@@ -2676,6 +2958,23 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                 tsx_base = _render_wrap_re.sub(r'\1<ErrorBoundary>\2</ErrorBoundary>\3', tsx_base)
                 if tsx_base != _before_rw:
                     narrate("Juniper Ryle", "DOMAIN ASSEMBLY AUTO-FIX: Wrapped root .render() call with ErrorBoundary to prevent blank-screen crash.")
+            # AUTO-FIX: Normalize non-canonical ErrorBoundary fallback phrases to the canonical
+            # "Module View Error" heading and "Retry" button label required by the build gate
+            # and the headless render check. The LLM sometimes uses "View Render Failure",
+            # "View Crashed", etc. Replace ALL bad variants in a single deterministic pass.
+            _bad_eb_phrase_map = {
+                "View Render Failure": "Module View Error",
+                "View Crashed": "Module View Error",
+                "Module Rendering Error": "Module View Error",
+                "View Error": "Module View Error",
+                "Attempt Recovery": "Retry",
+                "Retry View Initialization": "Retry",
+            }
+            _eb_norm_before = tsx_base
+            for _bp, _gp in _bad_eb_phrase_map.items():
+                tsx_base = tsx_base.replace(_bp, _gp)
+            if tsx_base != _eb_norm_before:
+                narrate("Juniper Ryle", "DOMAIN ASSEMBLY AUTO-FIX: Normalized ErrorBoundary fallback text to canonical 'Module View Error' + 'Retry'.")
             # AUTO-FIX: Hoist scope-trapped Icon* components to module level.
             # LLMs define `const IconX = () => <svg...>;` INSIDE domain view functions.
             # When WeatherView uses <IconActivity /> but the definition is inside AiLabView
@@ -3099,6 +3398,21 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                 tsx_base = ''.join(_pjsx_lines)
                 narrate("Juniper Ryle", f"DOMAIN ASSEMBLY AUTO-FIX: Proactively escaped {_pjsx_count} JSX text node(s) containing bare > or < comparison operators (prevents esbuild JSX errors).")
 
+            # AUTO-FIX: Parenthesize `?? expr ||` operator-precedence violations.
+            # Root cause: esbuild (and the JS spec) forbids mixing `??` and `||` at the
+            # same expression level without explicit parentheses. LLMs routinely generate
+            # patterns like `val ?? fallback || default` which esbuild rejects as a hard
+            # syntax error. Each occurrence stops the ENTIRE build — one bad line means
+            # zero output. This proactive pass wraps every `LHS ?? RHS ||` as
+            # `(LHS ?? RHS) ||` so the expression has unambiguous precedence.
+            # Safety: only rewrites when the `??` RHS is a simple literal/identifier that
+            # cannot itself contain a `??` — avoids mangling already-parenthesized chains.
+            _nc_before = tsx_base
+            tsx_base = _fix_nullish_coalescing(tsx_base)
+            if tsx_base != _nc_before:
+                _nc_count = len(_NC_COALESCING_RE.findall(_nc_before))
+                narrate("Juniper Ryle", f"DOMAIN ASSEMBLY AUTO-FIX: Parenthesized {_nc_count} `?? value ||` operator-precedence expression(s) — prevents esbuild 'Cannot use ?? with || without parentheses' error.")
+
             # AUTO-FIX: Strip LLM-hallucinated non-ASCII characters from URL/SVG contexts.
             # Gemini occasionally injects Bengali, Arabic, or CJK characters inside SVG xmlns
             # URLs or https:// strings — they build successfully (valid UTF-8) but silently
@@ -3188,6 +3502,28 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             merged_blob["styles.css"] = _da_css or "/* styles */"
             narrate("Juniper Ryle", f"DOMAIN ASSEMBLY: styles.css complete ({len(merged_blob['styles.css'])} chars).")
             narrate("Marcus Hale", f"DOMAIN ASSEMBLY COMPLETE: All {len(extracted_views)} domain(s) assembled.")
+
+            # ── POST-ASSEMBLY CONTRACT GUARANTEE ─────────────────────────────────────
+            # Enforce the three mandatory app.py boilerplate declarations AFTER all
+            # domain routes have been merged. If any are missing the LLM skeleton was
+            # incomplete — inject them deterministically rather than failing at build gate.
+            _pa_app = merged_blob.get("app.py", "")
+            _pa_changed = False
+            if "import os" not in _pa_app:
+                _pa_app = "import os\n" + _pa_app
+                _pa_changed = True
+                narrate("Isaac Moreno", "POST-ASSEMBLY: Injected missing `import os` into app.py.")
+            if not re.search(r'^\s*router\s*=\s*APIRouter\s*\(\)', _pa_app, re.MULTILINE):
+                _fa_insert = "from fastapi import APIRouter\nrouter = APIRouter()\n\n"
+                _pa_app = _fa_insert + _pa_app
+                _pa_changed = True
+                narrate("Isaac Moreno", "POST-ASSEMBLY: Injected missing `router = APIRouter()` into app.py.")
+            if not re.search(r'^\s*def\s+register\s*\(\s*\)\s*:', _pa_app, re.MULTILINE):
+                _pa_app = _pa_app.rstrip() + "\n\ndef register():\n    return router\n"
+                _pa_changed = True
+                narrate("Isaac Moreno", "POST-ASSEMBLY: Appended missing `def register(): return router` to app.py.")
+            if _pa_changed:
+                merged_blob["app.py"] = _pa_app
 
             # ── STAGE 2.5A: POST-ASSEMBLY STATIC VALIDATION ─────────────────────────
             narrate("Dr. Mira Kessler", f"Running post-assembly static validation on index.tsx ({len(tsx_base)} chars)...")
@@ -3442,7 +3778,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             # ── STAGE 2.5B: LLM SELF-REVIEW & REPAIR ────────────────────────────────
             if _va_issues or len(tsx_base) > 50000:
                 _review_issues_str = "\n".join(f"  - {i}" for i in _va_issues) if _va_issues else "  (No static issues — review for runtime correctness)"
-                _review_file_too_large = len(tsx_base) > 80000
+                _review_file_too_large = True
 
                 if _review_file_too_large and _va_issues:
                     narrate("Dr. Mira Kessler", f"File is {len(tsx_base)} chars — too large for full LLM rewrite. Using targeted patch mode...")
@@ -3625,6 +3961,29 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             _app_py_cleaned = re.sub(r'\n{3,}', '\n\n', _app_py_cleaned)
             merged_blob["app.py"] = _app_py_cleaned
             narrate("Dr. Mira Kessler", "PRE-GATE AUTO-FIX: Stripped '# Placeholder' comment(s) from app.py — prevents false skeleton rejection.")
+
+        # POST-STRIP BOILERPLATE GUARANTEE: Placeholder stripping can inadvertently remove
+        # comment lines that contained the boilerplate strings (e.g. `# Placeholder: def register():`).
+        # The post-assembly guarantee skipped injection because the string appeared (in a comment),
+        # and stripping then removed that comment — leaving app.py without the actual function.
+        # Re-enforce all three mandatory declarations unconditionally after any stripping.
+        _psg_app = merged_blob.get("app.py", "")
+        if _psg_app:
+            _psg_changed = False
+            if not re.search(r'^\s*def\s+register\s*\(\s*\)\s*:', _psg_app, re.MULTILINE):
+                merged_blob["app.py"] = _psg_app.rstrip() + "\n\ndef register():\n    return router\n"
+                _psg_app = merged_blob["app.py"]
+                _psg_changed = True
+                narrate("Isaac Moreno", "POST-STRIP GUARANTEE: Re-injected `def register(): return router` (was removed by placeholder stripping).")
+            if not re.search(r'^\s*router\s*=\s*APIRouter\s*\(\)', _psg_app, re.MULTILINE):
+                merged_blob["app.py"] = "from fastapi import APIRouter\nrouter = APIRouter()\n\n" + merged_blob["app.py"]
+                _psg_app = merged_blob["app.py"]
+                _psg_changed = True
+                narrate("Isaac Moreno", "POST-STRIP GUARANTEE: Re-injected `router = APIRouter()` (was removed by placeholder stripping).")
+            if "import os" not in _psg_app:
+                merged_blob["app.py"] = "import os\n" + merged_blob["app.py"]
+                _psg_changed = True
+                narrate("Isaac Moreno", "POST-STRIP GUARANTEE: Re-injected `import os` (was removed by placeholder stripping).")
 
         # PRE-GATE AUTO-FIX: Scrub any remaining raw OWM API key literals from index.tsx.
         # Even with the mandate, LLMs or old auto-fixes may still embed the raw 32-char hex key
@@ -3860,7 +4219,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                 _bad_lns = _jsx_p_re.findall(_ir)
                 if _bad_lns:
                     _src = merged_blob.get("index.tsx", "")
-                    _ls = _src.splitlines()
+                    _ls = _src.splitlines(keepends=True)
                     _changed = False
                     for _lns, _cols in _bad_lns:
                         _ln = int(_lns) - 1
@@ -3873,15 +4232,16 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                 narrate("Juniper Ryle", f"EXCESS-BRACE REPAIR [{label}]: Deleted orphaned `}};` at line {_bad_lns[0][0]}. Retrying esbuild...")
                             else:
                                 # Multiple cascading braces — collapse to single
-                                _new = re.sub(r'(\};){2,}', '};', _ls[_ln])
+                                _eol = '\n' if _ls[_ln].endswith('\n') else ''
+                                _new = re.sub(r'(\};){2,}', '};', _ls[_ln].rstrip('\r\n'))
                                 _new = re.sub(r'(\}){2,}(?=\s*$)', '}', _new)
-                                if _new != _ls[_ln]:
-                                    _ls[_ln] = _new
+                                if _new + _eol != _ls[_ln]:
+                                    _ls[_ln] = _new + _eol
                                     _changed = True
                                     narrate("Juniper Ryle", f"EXCESS-BRACE REPAIR [{label}]: Collapsed cascading `}};` on line {_bad_lns[0][0]}. Retrying esbuild...")
                             break
                     if _changed:
-                        _fixed = '\n'.join(_ls)
+                        _fixed = ''.join(_ls)
                         merged_blob["index.tsx"] = _fixed
                         try:
                             with open(_tsx_jsx_path, "w", encoding="utf-8") as _f:
@@ -3973,67 +4333,12 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             _jsx_unterminated_re = re.compile(r'Unterminated string literal', re.IGNORECASE)
             if _jsx_unterminated_re.search(_ir):
                 _src = merged_blob.get("index.tsx", "")
-                _ls = _src.splitlines(keepends=True)
-                _us_count = 0
-                _us_qt_carry = False
-                _us_in_block_comment = False
-                for _us_i, _us_ln in enumerate(_ls):
-                    _us_qs = False; _us_qd = False; _us_qt = _us_qt_carry
-                    _us_lqcol = -1; _us_lqch = None; _us_ci = 0
-                    while _us_ci < len(_us_ln):
-                        _us_ch = _us_ln[_us_ci]
-                        if _us_in_block_comment:
-                            if _us_ln[_us_ci:_us_ci + 2] == '*/':
-                                _us_in_block_comment = False
-                                _us_ci += 2
-                            else:
-                                _us_ci += 1
-                            continue
-                        if not (_us_qs or _us_qd or _us_qt):
-                            if _us_ln[_us_ci:_us_ci + 2] == '//':
-                                break
-                            if _us_ln[_us_ci:_us_ci + 2] == '/*':
-                                _us_in_block_comment = True
-                                _us_ci += 2
-                                continue
-                        if _us_ch == '\\' and (_us_qs or _us_qd):
-                            _us_ci += 2; continue
-                        if _us_ch == '`':
-                            _us_qt = not _us_qt
-                        elif not _us_qt:
-                            if _us_ch == "'" and not _us_qd:
-                                _us_qs = not _us_qs
-                                if _us_qs: _us_lqcol = _us_ci; _us_lqch = "'"
-                            elif _us_ch == '"' and not _us_qs:
-                                _us_qd = not _us_qd
-                                if _us_qd: _us_lqcol = _us_ci; _us_lqch = '"'
-                        _us_ci += 1
-                    _us_qt_carry = _us_qt
-                    if (_us_qs or _us_qd) and _us_lqch and _us_lqcol >= 0:
-                        _us_jsx_text_apos = False
-                        if _us_lqch == "'":
-                            for _ujxt_i in range(_us_lqcol - 1, -1, -1):
-                                _ujxt_ch = _us_ln[_ujxt_i]
-                                if _ujxt_ch == '>':
-                                    _us_jsx_text_apos = True
-                                    break
-                                if _ujxt_ch in ('{', '<', '(', '"', '='):
-                                    break
-                        if _us_jsx_text_apos:
-                            continue
-                        _us_stripped = _us_ln.rstrip('\r\n')
-                        _us_has_split = bool(re.search(r'\.split\(\s*$', _us_stripped[:_us_lqcol]))
-                        if _us_has_split:
-                            _ls[_us_i] = _us_stripped + _us_lqch + ')\n'
-                        else:
-                            _ls[_us_i] = _us_stripped + _us_lqch + '\n'
-                        _us_count += 1
+                _fixed_src, _us_count = _fix_unterminated_strings(_src)
                 if _us_count > 0:
-                    _fixed = ''.join(_ls)
-                    merged_blob["index.tsx"] = _fixed
+                    merged_blob["index.tsx"] = _fixed_src
                     try:
                         with open(_tsx_jsx_path, "w", encoding="utf-8") as _f:
-                            _f.write(_fixed)
+                            _f.write(_fixed_src)
                     except Exception as _we:
                         narrate("Juniper Ryle", f"UNTERMINATED-STRING REPAIR: Could not rewrite index.tsx: {_we}")
                     narrate("Juniper Ryle", f"UNTERMINATED-STRING REPAIR [{label}]: Fixed {_us_count} unterminated string(s). Retrying esbuild...")
@@ -4066,6 +4371,58 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     if "ERROR" not in _ir:
                         return _ir, True
 
+            # Handle "The character '}' is not valid inside a JSX element" at col 0
+            # on a component-closing `};` line.  Root cause: the component's JSX
+            # `return (` block was never closed with `)`, so esbuild is still in JSX
+            # mode when it sees `}` end the component function body.
+            # Fix: scan backward from the error line; insert `);` just before the `};`
+            # to close the unclosed JSX return expression.  Also handles the companion
+            # "The character '>' is not valid" error that fires on the NEXT component's
+            # arrow function `() => {` (the `>` is not bare JSX — it's an arrow op).
+            _jsx_close_brace_re = re.compile(
+                r'character ["\']}\s*["\'] is not valid inside a JSX element', re.IGNORECASE
+            )
+            if _jsx_close_brace_re.search(_ir):
+                # Extract line number from the SPECIFIC "}" error, not from any prior error.
+                _jsx_cb_pos_re = re.compile(
+                    r'character\s+["\']}\s*["\']\s+is not valid inside a JSX element'
+                    r'[\s\S]{0,200}?index\.tsx:(\d+):(\d+)',
+                    re.IGNORECASE
+                )
+                _cb_pos_m = _jsx_cb_pos_re.search(_ir)
+                if _cb_pos_m:
+                    _src_cb = merged_blob.get("index.tsx", "")
+                    _ls_cb = _src_cb.splitlines(keepends=True)
+                    _err_ln_cb = int(_cb_pos_m.group(1)) - 1
+                    _err_col_cb = int(_cb_pos_m.group(2))
+                    _err_stripped_cb = _ls_cb[_err_ln_cb].strip() if _err_ln_cb < len(_ls_cb) else ""
+                    if _err_stripped_cb in ('};', '}', '})') and _err_col_cb == 0:
+                        # Verify the error is genuine: scan backward to check paren imbalance
+                        _scan_open = 0
+                        _scan_close = 0
+                        for _sci in range(_err_ln_cb - 1, max(0, _err_ln_cb - 800), -1):
+                            _sl = _ls_cb[_sci]
+                            _sl_s = _sl.strip()
+                            if _sl_s.startswith('//') or _sl_s.startswith('*'):
+                                continue
+                            _scan_open += _sl.count('(')
+                            _scan_close += _sl.count(')')
+                            if re.search(r'\breturn\s*\(', _sl):
+                                break
+                        if _scan_open > _scan_close:
+                            _ls_cb.insert(_err_ln_cb, ');\n')
+                            _fixed_cb = ''.join(_ls_cb)
+                            merged_blob["index.tsx"] = _fixed_cb
+                            try:
+                                with open(_tsx_jsx_path, "w", encoding="utf-8") as _f:
+                                    _f.write(_fixed_cb)
+                            except Exception as _we:
+                                narrate("Juniper Ryle", f"UNCLOSED-JSX-RETURN REPAIR: Could not rewrite index.tsx: {_we}")
+                            narrate("Juniper Ryle", f"UNCLOSED-JSX-RETURN REPAIR [{label}]: Inserted `);` before component closing brace at line {_cb_pos_m.group(1)} to close unclosed JSX return block. Retrying esbuild...")
+                            _ir = await _run_loop.run_in_executor(None, lambda: tool_run_integration(f"Integrate {module_name}", module_name=module_name))
+                            if "ERROR" not in _ir:
+                                return _ir, True
+
             for _ja in range(5):
                 if not _jsx_c_re.search(_ir) or not _jsx_p_re.findall(_ir):
                     break
@@ -4080,6 +4437,13 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         _l = _ls[_ln]
                         for _c in [_col, _col - 1, _col + 1]:
                             if 0 <= _c < len(_l) and _l[_c] in ('>', '<'):
+                                # Guard: never escape `>` that is part of `=>` (arrow function).
+                                # The `>` in arrow functions is valid TypeScript/JS syntax —
+                                # esbuild only flags it because a PREVIOUS unclosed JSX return
+                                # left the parser in JSX mode. Escaping `=>` as `={'>'}`
+                                # corrupts the arrow function and creates new syntax errors.
+                                if _l[_c] == '>' and _c > 0 and _l[_c - 1] == '=':
+                                    break
                                 _bad = _l[_c]
                                 _ls[_ln] = _l[:_c] + "{'" + _bad + "'}" + _l[_c + 1:]
                                 _fixes += 1
@@ -4149,8 +4513,19 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     from tools.render_check import check_module_renders
                     _rc = await check_module_renders(module_name)
                 except Exception as _rc_err:
-                    narrate("Dr. Mira Kessler", f"Render check unavailable: {_rc_err}. Skipping.")
-                    _rc_final_passed = True
+                    _rc_err_s = str(_rc_err).lower()
+                    _rc_is_missing = (
+                        "playwright not installed" in _rc_err_s
+                        or "no module named 'playwright'" in _rc_err_s
+                        or "modulenotfounderror" in _rc_err_s
+                        or "cannot import" in _rc_err_s
+                    )
+                    if _rc_is_missing:
+                        narrate("Dr. Mira Kessler", "Render check SKIPPED — Playwright not installed.")
+                        _rc_final_passed = True
+                    else:
+                        narrate("Dr. Mira Kessler", f"Render check CRASHED (attempt {_rc_attempt + 1}): {str(_rc_err)[:200]}. Treating as failed.")
+                        _rc_last_failures = [f"Render check crashed: {str(_rc_err)[:200]}"]
                     break
 
                 if _rc["rendered"]:
@@ -4191,6 +4566,233 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         f"  Toggles: {_rc_func_summary.get('toggles', {}).get('found', 0)} found, {_rc_func_summary.get('toggles', {}).get('responsive', 0)} responsive\n"
                         f"  Data Sections: {_rc_func_summary.get('data_sections', {}).get('found', 0)} found, {_rc_func_summary.get('data_sections', {}).get('with_content', 0)} have content\n"
                     )
+
+                # SCRIPT-SRC 404 REPAIR (deterministic, no LLM):
+                # A blank screen can be caused by the built index.html referencing the TypeScript
+                # source file (index.tsx / index.ts) as its <script type="module" src="...">.
+                # The browser 404s that file and React never mounts — root innerHTML stays 0.
+                # Root cause: build.py copied index.html without rewriting src="index.tsx"→"index.js".
+                # Detection: console errors will contain a 404 mentioning "index.tsx" or "index.ts".
+                # Fix: rewrite the built index.html directly; no rebuild needed (index.js exists).
+                if _rc_is_blank:
+                    _rc_built_html = os.path.join(
+                        config.PROJECT_ROOT, "backend", "static", "built", "modules", module_name, "index.html"
+                    )
+                    _rc_built_js = os.path.join(
+                        config.PROJECT_ROOT, "backend", "static", "built", "modules", module_name, "index.js"
+                    )
+                    _rc_cons_joined = " ".join(_rc.get("console_errors", []))
+                    _rc_is_script_src_404 = (
+                        os.path.exists(_rc_built_js)
+                        and os.path.exists(_rc_built_html)
+                        and (
+                            "index.tsx" in _rc_cons_joined
+                            or "index.ts" in _rc_cons_joined
+                            or (
+                                os.path.exists(_rc_built_html)
+                                and ('src="index.tsx"' in open(_rc_built_html, encoding="utf-8", errors="replace").read()
+                                     or "src='index.tsx'" in open(_rc_built_html, encoding="utf-8", errors="replace").read())
+                            )
+                        )
+                    )
+                    if _rc_is_script_src_404:
+                        try:
+                            _rc_html_content = open(_rc_built_html, encoding="utf-8", errors="replace").read()
+                            _rc_html_orig = _rc_html_content
+                            _rc_html_content = _rc_html_content.replace('src="index.tsx"', 'src="index.js"')
+                            _rc_html_content = _rc_html_content.replace("src='index.tsx'", "src='index.js'")
+                            _rc_html_content = _rc_html_content.replace('src="index.ts"', 'src="index.js"')
+                            _rc_html_content = _rc_html_content.replace("src='index.ts'", "src='index.js'")
+                            if _rc_html_content != _rc_html_orig:
+                                with open(_rc_built_html, "w", encoding="utf-8", errors="replace") as _rc_f:
+                                    _rc_f.write(_rc_html_content)
+                                narrate("Juniper Ryle", f"SCRIPT-SRC REPAIR: Rewrote index.tsx → index.js in built index.html for '{module_name}'. Retrying render check...")
+                                continue
+                        except Exception as _rc_src_err:
+                            narrate("Juniper Ryle", f"SCRIPT-SRC REPAIR: Failed to patch built index.html: {_rc_src_err}")
+
+                # CONSTRUCTOR-WITHOUT-NEW REPAIR (deterministic, no LLM):
+                # "Constructor X requires 'new'" runtime error occurs when an ES6 class
+                # (most commonly Leaflet's L.Map) is called as a plain function.
+                # Detection: the error appears in console_errors as "[uncaught]" or "[error]".
+                # Fix: scan index.tsx for L.Map( without preceding 'new' and add it.
+                # This runs EVERY attempt — catches both initial blank and per-view failures.
+                _rc_cons_all = " ".join(_rc.get("console_errors", []))
+                _rc_ctor_err = re.search(
+                    r'constructor\s+\w+\s+requires\s+["\']new["\']', _rc_cons_all, re.IGNORECASE
+                )
+                if _rc_ctor_err:
+                    _rc_tsx_ctor = merged_blob.get("index.tsx", "")
+                    _rc_tsx_ctor_fixed = _rc_tsx_ctor
+                    _rc_tsx_ctor_fixed = re.sub(r'\bL\.Map\s*\(', 'new L.Map(', _rc_tsx_ctor_fixed)
+                    _rc_tsx_ctor_fixed = re.sub(r'\bnew\s+new\s+L\.Map\s*\(', 'new L.Map(', _rc_tsx_ctor_fixed)
+                    if _rc_tsx_ctor_fixed != _rc_tsx_ctor:
+                        merged_blob["index.tsx"] = _rc_tsx_ctor_fixed
+                        _rc_tsx_path = os.path.join(
+                            config.PROJECT_ROOT, "backend", "modules", module_name, "index.tsx"
+                        )
+                        try:
+                            with open(_rc_tsx_path, "w", encoding="utf-8") as _rc_cf:
+                                _rc_cf.write(_rc_tsx_ctor_fixed)
+                        except Exception:
+                            pass
+                        narrate("Juniper Ryle", f"CONSTRUCTOR-NEW REPAIR: Added 'new' before L.Map() in index.tsx — 'Constructor Map requires new' error detected in console. Rebuilding...")
+                        _rc_ctor_loop = asyncio.get_running_loop()
+                        _rc_ir_ctor = await _rc_ctor_loop.run_in_executor(None, lambda: tool_run_integration(f"Integrate {module_name}", module_name=module_name))
+                        if "ERROR" not in _rc_ir_ctor:
+                            continue
+
+                # UNDEFINED-PROPERTY REPAIR (deterministic):
+                # "Cannot read properties of undefined (reading 'X')" fires when array
+                # items are null/undefined and code accesses properties like .time / .magnitude
+                # / .properties / .geometry without a null-check.
+                # Fix: in the TSX source, convert common data-access chains that lack optional
+                # chaining to use ?. — specifically the pattern `eq.properties.` or
+                # `item.geometry.` in array map callbacks.
+                _rc_undef_err = re.search(
+                    r"Cannot read propert(?:y|ies) of (undefined|null) \(reading '(\w+)'\)",
+                    _rc_cons_all
+                )
+                if _rc_undef_err:
+                    _rc_missing_prop = _rc_undef_err.group(2)
+                    _rc_tsx_undef = merged_blob.get("index.tsx", "")
+                    _rc_tsx_undef_fixed = _rc_tsx_undef
+                    # Heuristic: patterns like `item.properties.X`, `eq.geometry.X`,
+                    # `data.X` in .map() callbacks — add optional chaining before the dot.
+                    # We target the specific missing property name from the error.
+                    _rc_prop_re = re.compile(
+                        r'\b(\w+)\.(' + re.escape(_rc_missing_prop) + r')\b(?!\?)',
+                        re.MULTILINE
+                    )
+                    def _rc_add_optional(m):
+                        obj, prop = m.group(1), m.group(2)
+                        if obj in ('this', 'window', 'document', 'process', 'Math', 'Date', 'JSON', 'console', 'Promise', 'Object', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'Error', 'undefined', 'null'):
+                            return m.group(0)
+                        return f'{obj}?.{prop}'
+                    _rc_tsx_undef_fixed = _rc_prop_re.sub(_rc_add_optional, _rc_tsx_undef_fixed)
+                    if _rc_tsx_undef_fixed != _rc_tsx_undef:
+                        merged_blob["index.tsx"] = _rc_tsx_undef_fixed
+                        _rc_undef_tsx_path = os.path.join(
+                            config.PROJECT_ROOT, "backend", "modules", module_name, "index.tsx"
+                        )
+                        try:
+                            with open(_rc_undef_tsx_path, "w", encoding="utf-8") as _rc_uf:
+                                _rc_uf.write(_rc_tsx_undef_fixed)
+                        except Exception:
+                            pass
+                        narrate("Juniper Ryle", f"UNDEFINED-PROPERTY REPAIR: Added optional chaining for '.{_rc_missing_prop}' accesses — 'Cannot read properties of undefined' detected in console. Rebuilding...")
+                        _rc_undef_loop = asyncio.get_running_loop()
+                        _rc_ir_undef = await _rc_undef_loop.run_in_executor(None, lambda: tool_run_integration(f"Integrate {module_name}", module_name=module_name))
+                        if "ERROR" not in _rc_ir_undef:
+                            continue
+
+                # ARRAY-NOT-FUNCTION REPAIR (deterministic):
+                # "X.forEach is not a function" fires when the backend route returns an
+                # object (e.g. {items:[...]}) but the frontend state variable is set to
+                # the whole response object and then called with .forEach(), .map(), etc.
+                # Fix: replace every `X.forEach(`, `X.map(`, `X.filter(` etc. in index.tsx
+                # with `(Array.isArray(X) ? X : []).method(` to guarantee array safety.
+                # This runs EVERY attempt — catches both initial render and per-view failures.
+                _rc_foreach_err = re.search(
+                    r'(\w+)\.(?:forEach|map|filter|find|some|every|reduce)\s+is\s+not\s+a\s+function',
+                    _rc_cons_all, re.IGNORECASE
+                )
+                if _rc_foreach_err:
+                    _rc_var_name = _rc_foreach_err.group(1)
+                    _rc_tsx_fe = merged_blob.get("index.tsx", "")
+                    _rc_tsx_fe_fixed = _rc_tsx_fe
+                    for _arr_method in ('forEach', 'map', 'filter', 'find', 'findIndex', 'some', 'every', 'reduce', 'flatMap', 'includes'):
+                        _fe_method_re = re.compile(
+                            r'\b' + re.escape(_rc_var_name) + r'\.' + _arr_method + r'\s*\(',
+                            re.MULTILINE
+                        )
+                        _rc_tsx_fe_fixed = _fe_method_re.sub(
+                            f'(Array.isArray({_rc_var_name}) ? {_rc_var_name} : []).{_arr_method}(',
+                            _rc_tsx_fe_fixed
+                        )
+                    if _rc_tsx_fe_fixed != _rc_tsx_fe:
+                        merged_blob["index.tsx"] = _rc_tsx_fe_fixed
+                        _rc_fe_tsx_path = os.path.join(
+                            config.PROJECT_ROOT, "backend", "modules", module_name, "index.tsx"
+                        )
+                        try:
+                            with open(_rc_fe_tsx_path, "w", encoding="utf-8") as _rc_fe_f:
+                                _rc_fe_f.write(_rc_tsx_fe_fixed)
+                        except Exception:
+                            pass
+                        narrate("Juniper Ryle", f"ARRAY-NOT-FUNCTION REPAIR: Wrapped '{_rc_var_name}' with Array.isArray guard for all array methods — '{_rc_var_name}.forEach is not a function' detected in console. Rebuilding...")
+                        _rc_fe_loop = asyncio.get_running_loop()
+                        _rc_ir_fe = await _rc_fe_loop.run_in_executor(None, lambda: tool_run_integration(f"Integrate {module_name}", module_name=module_name))
+                        if "ERROR" not in _rc_ir_fe:
+                            continue
+
+                # INVALID-LATLNG REPAIR (deterministic):
+                # "Invalid LatLng object: (undefined, undefined)" fires when Leaflet receives
+                # undefined coordinates — typically because data items have null geometry or
+                # the coordinate property names don't match what the LLM assumed.
+                # Fix 1: add optional chaining to all .lat / .lon / .lng / .latitude /
+                #        .longitude property accesses so undefined propagates cleanly.
+                # Fix 2: add .filter() before every .map() callback that contains a
+                #        L.circleMarker or L.marker call to discard null items.
+                _rc_latlng_err = (
+                    "Invalid LatLng object: (undefined, undefined)" in _rc_cons_all
+                    or "invalid latlng" in _rc_cons_all.lower()
+                )
+                if _rc_latlng_err:
+                    _rc_tsx_ll = merged_blob.get("index.tsx", "")
+                    _rc_tsx_ll_fixed = _rc_tsx_ll
+                    # Fix 1: optional chaining on coordinate properties
+                    for _cp in ('lat', 'lon', 'lng', 'latitude', 'longitude'):
+                        _cp_re = re.compile(r'\b(\w+)\.(' + _cp + r')\b(?!\?)', re.MULTILINE)
+                        def _cp_guard(m, _prop=_cp):
+                            obj = m.group(1)
+                            if obj in ('this', 'window', 'document', 'process', 'Math', 'Date',
+                                       'JSON', 'console', 'L', 'map', 'layer', 'mapRef',
+                                       'undefined', 'null', 'Object', 'Array', 'String'):
+                                return m.group(0)
+                            return f'{obj}?.{_prop}'
+                        _rc_tsx_ll_fixed = _cp_re.sub(_cp_guard, _rc_tsx_ll_fixed)
+                    # Fix 2: before any .map( callback that contains L.circleMarker or L.marker,
+                    # inject a .filter(item => item != null) to guard against null array entries.
+                    _map_marker_re = re.compile(
+                        r'\b([\w.]+)\.map\((\s*(?:\([^)]*\)|\w+)\s*=>)',
+                        re.MULTILINE
+                    )
+                    def _inject_filter(m):
+                        arr_expr = m.group(1)
+                        callback_start = m.group(2)
+                        # Extract the item variable name from the callback signature
+                        _item_m = re.search(r'\(?\s*(\w+)', callback_start)
+                        if not _item_m:
+                            return m.group(0)
+                        _item_var = _item_m.group(1)
+                        # Check within 800 chars after this match for a L.circleMarker/L.marker
+                        _after_pos = m.end()
+                        _after_snippet = _rc_tsx_ll_fixed[_after_pos:_after_pos + 800]
+                        if not re.search(r'L\.(circleMarker|marker)\s*\(', _after_snippet):
+                            return m.group(0)
+                        # Don't double-inject if .filter is already right before .map
+                        _before_snippet = _rc_tsx_ll_fixed[max(0, m.start()-60):m.start()]
+                        if '.filter(' in _before_snippet:
+                            return m.group(0)
+                        # Inject: arr.filter(item => item != null).map(...)
+                        return f'{arr_expr}.filter(({_item_var}) => {_item_var} != null).map({callback_start}'
+                    _rc_tsx_ll_fixed = _map_marker_re.sub(_inject_filter, _rc_tsx_ll_fixed)
+                    if _rc_tsx_ll_fixed != _rc_tsx_ll:
+                        merged_blob["index.tsx"] = _rc_tsx_ll_fixed
+                        _rc_ll_tsx_path = os.path.join(
+                            config.PROJECT_ROOT, "backend", "modules", module_name, "index.tsx"
+                        )
+                        try:
+                            with open(_rc_ll_tsx_path, "w", encoding="utf-8") as _rc_ll_f:
+                                _rc_ll_f.write(_rc_tsx_ll_fixed)
+                        except Exception:
+                            pass
+                        narrate("Juniper Ryle", "INVALID-LATLNG REPAIR: Added optional chaining on coordinate properties and null-filter before L.circleMarker map() callbacks — 'Invalid LatLng object: (undefined, undefined)' detected. Rebuilding...")
+                        _rc_ll_loop = asyncio.get_running_loop()
+                        _rc_ir_ll = await _rc_ll_loop.run_in_executor(None, lambda: tool_run_integration(f"Integrate {module_name}", module_name=module_name))
+                        if "ERROR" not in _rc_ir_ll:
+                            continue
 
                 # API 404 REPAIR: if the render check found backend routes that return 404,
                 # patch app.py to add the missing routes BEFORE attempting any TSX repair.
@@ -4233,6 +4835,10 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         if _rc_404_skel:
                             narrate("Isaac Moreno", f"RENDER CHECK 404 REPAIR: Rejecting patch — contains skeleton token '{_rc_404_skel.group()}'.")
                         elif len(_rc_404_content) >= len(_rc_app_py) * 0.8:
+                            if not re.search(r'^\s*router\s*=\s*APIRouter\s*\(\)', _rc_404_content, re.MULTILINE):
+                                _rc_404_content = "from fastapi import APIRouter\nrouter = APIRouter()\n\n" + _rc_404_content
+                            if not re.search(r'^\s*def\s+register\s*\(\s*\)\s*:', _rc_404_content, re.MULTILINE):
+                                _rc_404_content = _rc_404_content.rstrip() + "\n\ndef register():\n    return router\n"
                             merged_blob["app.py"] = _rc_404_content
                             narrate("Isaac Moreno", f"RENDER CHECK 404 REPAIR: app.py patched to add {len(_rc_api_404s)} missing route(s). Rebuilding...")
                             _rc_404_loop = asyncio.get_running_loop()
@@ -4242,6 +4848,126 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                 continue
                         else:
                             narrate("Isaac Moreno", "RENDER CHECK 404 REPAIR: LLM returned suspiciously short app.py — skipping.")
+
+                # ---- API 500 REPAIR: routes that crash on every request ----
+                # render_check now tracks api_500s alongside api_404s. A 500 means the route
+                # exists in app.py but throws a runtime exception (most common: NameError from
+                # a module-level cache dict used in a function body without being declared at
+                # module scope). The LLM sees the full app.py and is told which routes are
+                # crashing so it can diagnose and fix the root cause.
+                _rc_api_500s = _rc.get("api_500s", [])
+                if _rc_api_500s:
+                    _rc_app_py_500 = merged_blob.get("app.py", "")
+                    _rc_500_paths_str = "\n".join(f"  - {p}" for p in _rc_api_500s[:8])
+                    narrate("Isaac Moreno", f"RENDER CHECK 500 REPAIR: {len(_rc_api_500s)} route(s) returned 500 — diagnosing and patching app.py...")
+                    _rc_500_prompt = (
+                        f"OUTPUT ONLY THE COMPLETE CORRECTED app.py. NO explanations, NO markdown fences.\n\n"
+                        f"API 500 ERROR REPAIR:\n"
+                        f"The following backend route(s) return HTTP 500 on every request because "
+                        f"they throw a Python runtime exception:\n{_rc_500_paths_str}\n\n"
+                        f"COMMON CAUSES AND REQUIRED FIXES:\n"
+                        f"1. NameError: module-level dict referenced in a function but never declared at module scope.\n"
+                        f"   FIX: Add `_cache_name = {{\"result\": None, \"timestamp\": 0, \"running\": False}}` "
+                        f"BEFORE the first @router decorator (at module scope, not inside any function).\n"
+                        f"2. Missing import (e.g. `datetime` used but not imported).\n"
+                        f"   FIX: Add the missing import at the top of the file.\n"
+                        f"3. Attribute error on None (API returned None, code tries to subscript it).\n"
+                        f"   FIX: Add None-checks before subscripting API response data.\n\n"
+                        f"TASK: Diagnose and fix ALL routes listed above. Ensure every module-level "
+                        f"variable used inside @router handler functions is declared at module scope.\n\n"
+                        f"CURRENT app.py:\n{_rc_app_py_500[:60000]}"
+                    )
+                    _rc_500_res = await call_llm_async(
+                        config.GEMINI_MODEL_31_CUSTOMTOOLS, _rc_500_prompt,
+                        system_instruction=marcus_system_instruction,
+                        max_tokens=65536, persona_name="Isaac Moreno",
+                        history=None, blocked_models=BUILD_BLOCKED_MODELS,
+                        disable_search=True,
+                        thinking_level="none"
+                    )
+                    _rc_500_content = _rc_500_res.get("text", "").strip()
+                    if _rc_500_content:
+                        if _rc_500_content.startswith("```"):
+                            _rc_500_content = re.sub(r'^```(?:[\w]*)?\n?', '', _rc_500_content)
+                            _rc_500_content = re.sub(r'\n?```$', '', _rc_500_content).strip()
+                        _rc_500_skel = re.search(
+                            r'\bTODO:|\bFIXME:|implementation\s*here|implementation pending|(?://|#)\s*Placeholder\b|<div[^>]*>\s*Placeholder\s*</div>|\bmock_|example\.com',
+                            _rc_500_content, re.IGNORECASE
+                        )
+                        if _rc_500_skel:
+                            narrate("Isaac Moreno", f"RENDER CHECK 500 REPAIR: Rejecting patch — contains skeleton token '{_rc_500_skel.group()}'.")
+                        elif len(_rc_500_content) >= len(_rc_app_py_500) * 0.8:
+                            if not re.search(r'^\s*router\s*=\s*APIRouter\s*\(\)', _rc_500_content, re.MULTILINE):
+                                _rc_500_content = "from fastapi import APIRouter\nrouter = APIRouter()\n\n" + _rc_500_content
+                            if not re.search(r'^\s*def\s+register\s*\(\s*\)\s*:', _rc_500_content, re.MULTILINE):
+                                _rc_500_content = _rc_500_content.rstrip() + "\n\ndef register():\n    return router\n"
+                            merged_blob["app.py"] = _rc_500_content
+                            narrate("Isaac Moreno", f"RENDER CHECK 500 REPAIR: app.py patched to fix {len(_rc_api_500s)} crashing route(s). Rebuilding...")
+                            _rc_500_loop = asyncio.get_running_loop()
+                            _rc_ir_500 = await _rc_500_loop.run_in_executor(None, lambda: tool_run_integration(f"Integrate {module_name}", module_name=module_name))
+                            if "ERROR" not in _rc_ir_500:
+                                narrate("Isaac Moreno", "RENDER CHECK 500 REPAIR: Rebuild succeeded after fixing crashing routes.")
+                                continue
+                        else:
+                            narrate("Isaac Moreno", "RENDER CHECK 500 REPAIR: LLM returned suspiciously short app.py — skipping.")
+
+                # ---- RENDER CHECK 422 REPAIR ----
+                # render_check now tracks api_422s. A 422 means the route exists in app.py
+                # and doesn't crash, but the frontend fetch call omits required query parameters
+                # (most commonly lat and lon). This is purely a frontend bug — the fix is to
+                # append ?lat=${lat}&lon=${lon} (or other required params) to the fetch URL
+                # in index.tsx. Sending app.py would be wrong; only index.tsx needs repair.
+                _rc_api_422s = _rc.get("api_422s", [])
+                if _rc_api_422s:
+                    _rc_tsx_422 = merged_blob.get("index.tsx", "")
+                    _rc_422_paths_str = "\n".join(f"  - {p}" for p in _rc_api_422s[:8])
+                    narrate("Juniper Ryle", f"RENDER CHECK 422 REPAIR: {len(_rc_api_422s)} route(s) returned 422 — fixing missing query params in index.tsx fetch calls...")
+                    _rc_422_numbered = "\n".join(f"{i+1}: {ln}" for i, ln in enumerate(_rc_tsx_422.split("\n")))
+                    _rc_422_prompt = (
+                        f"OUTPUT ONLY line-edit patches in this exact format:\n"
+                        f"LINE <n>: <complete replacement line>\n"
+                        f"Do NOT output any other text.\n\n"
+                        f"API 422 ERROR REPAIR (FRONTEND FIX):\n"
+                        f"The following backend routes returned HTTP 422 Unprocessable Entity because the "
+                        f"frontend fetch calls are missing required query parameters:\n{_rc_422_paths_str}\n\n"
+                        f"HTTP 422 means the route DOES EXIST but rejected the request. The fix is ALWAYS "
+                        f"in index.tsx — find the fetch() call(s) for each 422 route and ensure they include "
+                        f"ALL required query parameters. The most common missing params are lat and lon.\n\n"
+                        f"REQUIRED FIX PATTERN:\n"
+                        f"  Wrong:   fetch(`/api/.../planets`)\n"
+                        f"  Correct: fetch(`/api/.../planets?lat=${{lat}}&lon=${{lon}}`)\n"
+                        f"Find the React state variables holding lat/lon (look for useState near geolocation) "
+                        f"and inject them into every 422 fetch URL listed above.\n\n"
+                        f"NUMBERED index.tsx:\n{_rc_422_numbered[:80000]}"
+                    )
+                    _rc_422_res = await call_llm_async(
+                        config.GEMINI_MODEL_31_CUSTOMTOOLS, _rc_422_prompt,
+                        system_instruction=marcus_system_instruction,
+                        max_tokens=8192, persona_name="Juniper Ryle",
+                        history=None, blocked_models=BUILD_BLOCKED_MODELS,
+                        disable_search=True,
+                        thinking_level="none"
+                    )
+                    _rc_422_text = _rc_422_res.get("text", "").strip()
+                    if _rc_422_text:
+                        _rc_422_lines = _rc_tsx_422.split("\n")
+                        _rc_422_applied = 0
+                        for _rc_422_patch_line in _rc_422_text.splitlines():
+                            _rc_422_m = re.match(r'^LINE\s+(\d+)\s*:\s*(.*)', _rc_422_patch_line)
+                            if _rc_422_m:
+                                _rc_422_lineno = int(_rc_422_m.group(1)) - 1
+                                _rc_422_replacement = _rc_422_m.group(2)
+                                if 0 <= _rc_422_lineno < len(_rc_422_lines):
+                                    _rc_422_lines[_rc_422_lineno] = _rc_422_replacement
+                                    _rc_422_applied += 1
+                        if _rc_422_applied > 0:
+                            merged_blob["index.tsx"] = "\n".join(_rc_422_lines)
+                            narrate("Juniper Ryle", f"RENDER CHECK 422 REPAIR: Applied {_rc_422_applied} line-edit(s) to fix missing query params. Rebuilding...")
+                            _rc_422_loop = asyncio.get_running_loop()
+                            _rc_ir_422 = await _rc_422_loop.run_in_executor(None, lambda: tool_run_integration(f"Integrate {module_name}", module_name=module_name))
+                            if "ERROR" not in _rc_ir_422:
+                                narrate("Juniper Ryle", "RENDER CHECK 422 REPAIR: Rebuild succeeded after fixing 422 routes.")
+                                continue
 
                 # ---- DETERMINISTIC PRE-LLM AUTO-FIX: layer-control onClick injection ----
                 # render_check reports failures like:
@@ -4261,23 +4987,37 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                 _rc_named_btn_labels.append(_nm)
                 _rc_btn_injected = 0
                 for _btn_label in _rc_named_btn_labels:
-                    _btn_pat = re.compile(
-                        r'(<button\b)([^>]*?)(>\s*' + re.escape(_btn_label) + r'\s*</button>)',
-                        re.IGNORECASE
-                    )
-                    def _inject_btn_click(m):
-                        _attrs = m.group(2) or ""
-                        if 'onClick' in _attrs or 'onclick' in _attrs.lower():
-                            return m.group(0)
-                        return m.group(1) + _attrs + " onClick={(e) => e.currentTarget.classList.toggle('active')}" + m.group(3)
-                    _new_src = _btn_pat.sub(_inject_btn_click, _rc_tsx_src)
-                    if _new_src != _rc_tsx_src:
-                        _rc_tsx_src = _new_src
+                    # Walk-back strategy: find the label text, then walk backwards up to 300 chars
+                    # to locate the opening <button tag. This correctly handles buttons whose
+                    # content includes icon children (e.g. <button><Icon /> Radar</button>),
+                    # which the old forward-regex missed because it required `>\s*LabelText`.
+                    _label_search = re.escape(_btn_label)
+                    for _lm in re.finditer(_label_search, _rc_tsx_src, re.IGNORECASE):
+                        _search_window = _rc_tsx_src[max(0, _lm.start() - 300): _lm.start()]
+                        _btn_rel = _search_window.rfind('<button')
+                        if _btn_rel == -1:
+                            continue
+                        _btn_abs = max(0, _lm.start() - 300) + _btn_rel
+                        # Find the end of the opening <button ...> tag
+                        _tag_end = _rc_tsx_src.find('>', _btn_abs)
+                        if _tag_end == -1:
+                            continue
+                        _attrs_str = _rc_tsx_src[_btn_abs: _tag_end + 1]
+                        if 'onClick' in _attrs_str or 'onclick' in _attrs_str.lower():
+                            break  # already has onClick — nothing to do
+                        # Inject onClick before the closing > of the opening tag
+                        _onclick_inject = " onClick={(e) => e.currentTarget.classList.toggle('active')}"
+                        _rc_tsx_src = (
+                            _rc_tsx_src[:_tag_end]
+                            + _onclick_inject
+                            + _rc_tsx_src[_tag_end:]
+                        )
                         _rc_btn_injected += 1
+                        break  # one injection per label; re-find next label in updated source
                 if _rc_btn_injected > 0:
                     _rc_fixed = _rc_tsx_src
                     merged_blob["index.tsx"] = _rc_tsx_src
-                    narrate("Juniper Ryle", f"RENDER-FIX AUTO-FIX: Injected onClick handler into {_rc_btn_injected} named layer-control button(s): {_rc_named_btn_labels[:_rc_btn_injected]}.")
+                    narrate("Juniper Ryle", f"RENDER-FIX AUTO-FIX: Injected onClick handler into {_rc_btn_injected} named layer-control button(s) via walk-back search: {_rc_named_btn_labels[:_rc_btn_injected]}.")
 
                 # ---- DETERMINISTIC PRE-LLM AUTO-FIX: oversized map container cap ----
                 # render_check reports failures like:
@@ -4313,7 +5053,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         merged_blob["index.tsx"] = _rc_tsx_src
                         narrate("Juniper Ryle", f"RENDER-FIX AUTO-FIX: Capped {_rc_oversize_count} oversized map container(s) with maxHeight:'70vh' (per MAP HEIGHT VIEWPORT CAP MANDATE).")
 
-                _rc_use_patch_mode = len(_rc_tsx_src) > 80000
+                _rc_use_patch_mode = True
 
                 if _rc_use_patch_mode:
                     _rc_view_failures = [ff for ff in _rc.get("functional_failures", []) if ff.startswith("VIEW ") or ff.startswith("MAPS:") or ff.startswith("TOGGLES:") or ff.startswith("BUTTONS:") or ff.startswith("NAV")]
@@ -4541,6 +5281,14 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     _rc_fixed = re.sub(r'\(window\s+as\s+(?:any|Window[^)]*)\)\.L\b', 'L', _rc_fixed)
                     if 'window.L' in _rc_fixed:
                         _rc_fixed = _rc_fixed.replace('window.L', 'L')
+                    # Fix: L.Map() requires 'new' — class constructor, not factory function.
+                    # Must reapply here because LLM render-fix output may reintroduce L.Map().
+                    if 'L.Map(' in _rc_fixed:
+                        _rcf_lmap_before = _rc_fixed
+                        _rc_fixed = re.sub(r'\bL\.Map\s*\(', 'new L.Map(', _rc_fixed)
+                        _rc_fixed = re.sub(r'\bnew\s+new\s+L\.Map\s*\(', 'new L.Map(', _rc_fixed)
+                        if _rc_fixed != _rcf_lmap_before:
+                            narrate("Dr. Mira Kessler", "RENDER-FIX AUTO-FIX: Added 'new' before L.Map() calls (Constructor Map requires 'new').")
                     # Fix: Lucide.X namespace usage in render-fix output.
                     # build_gate forbids `import * as Lucide` — rewrite to named imports instead.
                     if re.search(r'\bLucide\.[A-Z]', _rc_fixed):
@@ -4683,7 +5431,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             return await _stage5_render_check_and_complete("is now fully integrated and operational")
         else:
             errors_str = res.get('details', 'Unknown error')
-            _known_pfx = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:|DATA_ERROR:|RUNTIME_ERROR:)'
+            _known_pfx = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:|DATA_ERROR:|RUNTIME_ERROR:|FIDELITY_ERROR:|DENSITY_ERROR:)'
             error_list = [e.strip() for e in re.split(rf';\s*(?={_known_pfx})', errors_str) if e.strip()]
             skeleton_errors = [e for e in error_list if e.startswith("SKELETON:") and not e.startswith("SKELETON_VIEW:")]
             view_skeleton_errors = [e for e in error_list if e.startswith("SKELETON_VIEW:")]
@@ -4769,7 +5517,8 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                      and not e.startswith("RUNTIME_ERROR:")
                                      and not (e.startswith("CONTRACT_ERROR:") and "duplicate route path" in e)
                                      and not (e.startswith("CONTRACT_ERROR:") and "fetches" in e and "no matching" in e)
-                                     and not (e.startswith("CONTRACT_ERROR:") and "hardcoded 32-char hex API key" in e)]
+                                     and not (e.startswith("CONTRACT_ERROR:") and "hardcoded 32-char hex API key" in e)
+                                     and not (e.startswith("CONTRACT_ERROR:") and "app.py missing" in e)]
             if skeleton_errors and not _non_reparable_others and not view_skeleton_errors:
                 narrate("Dr. Mira Kessler", f"SKELETON REPAIR: Attempting targeted file regeneration for {len(skeleton_errors)} skeleton violation(s)...")
                 repaired = False
@@ -5021,90 +5770,63 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         _tsx_src = _escaped_jsx_tag_repair_re.sub(r'<\1', _tsx_src)
                         merged_blob["index.tsx"] = _tsx_src
                         narrate("Juniper Ryle", "TSX SYNTAX REPAIR: Un-escaped incorrectly escaped JSX tag openers ({'<'}Tag → <Tag).")
-                    _tsx_lines = _tsx_src.splitlines(keepends=True)
-                    _tsx_fixed_count = 0
-                    _tsr_in_block_comment = False
-                    _tsr_qt_carry = False
-                    for _tln_i, _tln_text in enumerate(_tsx_lines):
-                        _tsr_qs = False; _tsr_qd = False; _tsr_qt = _tsr_qt_carry
-                        _tsr_lqcol = -1; _tsr_lqch = None; _tsr_ci = 0
-                        while _tsr_ci < len(_tln_text):
-                            _tsr_ch = _tln_text[_tsr_ci]
-                            if _tsr_in_block_comment:
-                                if _tln_text[_tsr_ci:_tsr_ci + 2] == '*/':
-                                    _tsr_in_block_comment = False
-                                    _tsr_ci += 2
-                                else:
-                                    _tsr_ci += 1
-                                continue
-                            if not (_tsr_qs or _tsr_qd or _tsr_qt):
-                                if _tln_text[_tsr_ci:_tsr_ci + 2] == '//':
-                                    break
-                                if _tln_text[_tsr_ci:_tsr_ci + 2] == '/*':
-                                    _tsr_in_block_comment = True
-                                    _tsr_ci += 2
-                                    continue
-                            if _tsr_ch == '\\' and (_tsr_qs or _tsr_qd):
-                                _tsr_ci += 2; continue
-                            if _tsr_ch == '`':
-                                _tsr_qt = not _tsr_qt
-                            elif not _tsr_qt:
-                                if _tsr_ch == "'" and not _tsr_qd:
-                                    _tsr_qs = not _tsr_qs
-                                    if _tsr_qs: _tsr_lqcol = _tsr_ci; _tsr_lqch = "'"
-                                elif _tsr_ch == '"' and not _tsr_qs:
-                                    _tsr_qd = not _tsr_qd
-                                    if _tsr_qd: _tsr_lqcol = _tsr_ci; _tsr_lqch = '"'
-                            _tsr_ci += 1
-                        _tsr_qt_carry = _tsr_qt
-                        if (_tsr_qs or _tsr_qd) and _tsr_lqch and _tsr_lqcol >= 0:
-                            _tsr_jsx_text_apos = False
-                            if _tsr_lqch == "'":
-                                for _tjxt_i in range(_tsr_lqcol - 1, -1, -1):
-                                    _tjxt_ch = _tln_text[_tjxt_i]
-                                    if _tjxt_ch == '>':
-                                        _tsr_jsx_text_apos = True
-                                        break
-                                    if _tjxt_ch in ('{', '<', '(', '"', '='):
-                                        break
-                            if _tsr_jsx_text_apos:
-                                continue
-                            _tsr_stripped = _tln_text.rstrip('\r\n')
-                            _tsr_has_split = bool(re.search(r'\.split\(\s*$', _tsr_stripped[:_tsr_lqcol]))
-                            # Detect if this unclosed string is a JSX attribute value inside an
-                            # open tag that was never closed with '>'. Pattern: the last '<' before
-                            # the unclosed quote is NOT followed by a '>' on the same line.
-                            # If so, closing the string alone still leaves an unclosed JSX tag,
-                            # and the next line's '};' will cause 'Expected ">" but found "}"'.
-                            # Fix: append '/>' to self-close the open element after the closing quote.
-                            _tsr_before_quote = _tsr_stripped[:_tsr_lqcol]
-                            _tsr_last_lt = _tsr_before_quote.rfind('<')
-                            _tsr_last_gt = _tsr_before_quote.rfind('>')
-                            _tsr_in_jsx_attr = _tsr_last_lt >= 0 and _tsr_last_lt > _tsr_last_gt
-                            if _tsr_in_jsx_attr:
-                                _tsx_lines[_tln_i] = _tsr_stripped + _tsr_lqch + '/>\n'
-                                _tsx_fixed_count += 1
-                                narrate("Juniper Ryle", f"TSX SYNTAX REPAIR: Closed unterminated {_tsr_lqch} string at line {_tln_i + 1} (inside open JSX tag — self-closed with '/>').")
-                            elif _tsr_has_split:
-                                _tsx_lines[_tln_i] = _tsr_stripped + _tsr_lqch + ')\n'
-                                _tsx_fixed_count += 1
-                                narrate("Juniper Ryle", f"TSX SYNTAX REPAIR: Closed unterminated {_tsr_lqch} string at line {_tln_i + 1}.")
-                            else:
-                                _tsx_lines[_tln_i] = _tsr_stripped + _tsr_lqch + '\n'
-                                _tsx_fixed_count += 1
-                                narrate("Juniper Ryle", f"TSX SYNTAX REPAIR: Closed unterminated {_tsr_lqch} string at line {_tln_i + 1}.")
+                    _tsx_nc_before = _tsx_src
+                    _tsx_src = _fix_nullish_coalescing(_tsx_src)
+                    if _tsx_src != _tsx_nc_before:
+                        narrate("Juniper Ryle", f"TSX SYNTAX REPAIR: Parenthesized {len(_NC_COALESCING_RE.findall(_tsx_nc_before))} `?? value ||` operator-precedence expression(s).")
+                    _tsx_src, _tsx_fixed_count = _fix_unterminated_strings(_tsx_src)
+                    if _tsx_fixed_count:
+                        narrate("Juniper Ryle", f"TSX SYNTAX REPAIR: Closed {_tsx_fixed_count} unterminated string(s).")
+                    # Targeted line-number repair: _fix_unterminated_strings may close a different
+                    # line than the one the build gate flagged (template-literal carry divergence).
+                    # Parse the exact line number from each SYNTAX_ERROR and force-close that
+                    # specific line using a fresh single-line scan (no cross-line carry state).
+                    # This guarantees the reported line is fixed regardless of scanner disagreement.
+                    for _ts_err in [e for e in _tsx_syntax_errors if 'unterminated string literal at line' in e]:
+                        _ts_m = re.search(r'unterminated string literal at line (\d+)', _ts_err)
+                        if not _ts_m:
+                            continue
+                        _ts_ln_idx = int(_ts_m.group(1)) - 1
+                        _ts_lines = _tsx_src.splitlines(keepends=True)
+                        if 0 <= _ts_ln_idx < len(_ts_lines):
+                            _ts_raw = _ts_lines[_ts_ln_idx].rstrip('\r\n')
+                            _ts_in_sq = False; _ts_in_dq = False; _ts_ci = 0; _ts_last_q = None
+                            while _ts_ci < len(_ts_raw):
+                                _ts_ch = _ts_raw[_ts_ci]
+                                if _ts_ch == '\\' and (_ts_in_sq or _ts_in_dq):
+                                    _ts_ci += 2; continue
+                                if _ts_ch == '`':
+                                    _ts_ci += 1; continue
+                                if not _ts_in_dq and _ts_ch == "'":
+                                    _ts_in_sq = not _ts_in_sq
+                                    if _ts_in_sq: _ts_last_q = "'"
+                                elif not _ts_in_sq and _ts_ch == '"':
+                                    _ts_in_dq = not _ts_in_dq
+                                    if _ts_in_dq: _ts_last_q = '"'
+                                _ts_ci += 1
+                            _ts_unclosed = "'" if _ts_in_sq else '"' if _ts_in_dq else None
+                            if _ts_unclosed:
+                                _ts_lines[_ts_ln_idx] = _ts_raw + _ts_unclosed + '\n'
+                                _tsx_src = ''.join(_ts_lines)
+                                merged_blob["index.tsx"] = _tsx_src
+                                _tsx_fixed = True
+                                narrate("Juniper Ryle", f"TARGETED SYNTAX REPAIR: Force-closed unterminated {_ts_unclosed!r} on reported line {_ts_ln_idx + 1} (bypasses template-literal carry divergence).")
                     _regex_open_scan_re = re.compile(r'\.\s*(?:replace|match|search|split|test|exec|filter)\s*\(\s*/[^/\n]*$')
+                    _tsx_lines = _tsx_src.splitlines(keepends=True)
+                    _regex_fixed = 0
                     for _tln_i in range(len(_tsx_lines) - 1):
                         _tln_stripped = _tsx_lines[_tln_i].rstrip('\r\n')
                         if _regex_open_scan_re.search(_tln_stripped):
                             _next_ln = _tsx_lines[_tln_i + 1].rstrip('\r\n')
                             _tsx_lines[_tln_i] = _tln_stripped + _next_ln.lstrip() + '\n'
                             _tsx_lines[_tln_i + 1] = ''
-                            _tsx_fixed_count += 1
+                            _regex_fixed += 1
                             narrate("Juniper Ryle", f"TSX SYNTAX REPAIR: Joined split regex literal at line {_tln_i + 1}.")
-                    _tsx_fixed = _tsx_fixed_count > 0
+                    if _regex_fixed:
+                        _tsx_src = ''.join(_tsx_lines)
+                    _tsx_fixed = _tsx_fixed_count > 0 or _regex_fixed > 0 or (_tsx_src != _tsx_nc_before)
                     if _tsx_fixed:
-                        merged_blob["index.tsx"] = ''.join(_tsx_lines)
+                        merged_blob["index.tsx"] = _tsx_src
                     if duplicate_route_errors:
                         _app_dedup_src = merged_blob.get("app.py", "")
                         _app_dedup_lines = _app_dedup_src.splitlines(keepends=True)
@@ -5156,7 +5878,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             # fall through to the LAYOUT_ERROR/UI_ERROR REPAIR PROTOCOL below
                             # rather than bailing out. Refresh the error lists from res3 so
                             # that subsequent repair stages operate on the latest validation.
-                            _known_pfx_r = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:)'
+                            _known_pfx_r = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:|DATA_ERROR:|RUNTIME_ERROR:|FIDELITY_ERROR:|DENSITY_ERROR:)'
                             _re_err_list = [e.strip() for e in re.split(rf';\s*(?={_known_pfx_r})', _err2) if e.strip()]
                             _re_other = [e for e in _re_err_list if not e.startswith("SKELETON:") and not e.startswith("SKELETON_VIEW:")]
                             _re_truly_unrecoverable = [
@@ -5169,6 +5891,42 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                 and not e.startswith("RUNTIME_ERROR:")
                                 and not e.startswith("CONTRACT_ERROR:")
                             ]
+                            # If SYNTAX_ERROR STILL present after fix attempt, run one more
+                            # targeted line-number repair pass before deciding whether to fall through.
+                            # This handles the case where the fix closed the wrong line (carry divergence).
+                            _re_still_syntax = [e for e in _re_other if e.startswith("SYNTAX_ERROR:")]
+                            if _re_still_syntax:
+                                _tsx_src_r2 = merged_blob.get("index.tsx", "")
+                                _r2_fixed = False
+                                for _r2_err in [e for e in _re_still_syntax if 'unterminated string literal at line' in e]:
+                                    _r2_m = re.search(r'unterminated string literal at line (\d+)', _r2_err)
+                                    if not _r2_m:
+                                        continue
+                                    _r2_ln_idx = int(_r2_m.group(1)) - 1
+                                    _r2_lines = _tsx_src_r2.splitlines(keepends=True)
+                                    if 0 <= _r2_ln_idx < len(_r2_lines):
+                                        _r2_raw = _r2_lines[_r2_ln_idx].rstrip('\r\n')
+                                        _r2_sq = False; _r2_dq = False; _r2_ci = 0
+                                        while _r2_ci < len(_r2_raw):
+                                            _r2_ch = _r2_raw[_r2_ci]
+                                            if _r2_ch == '\\' and (_r2_sq or _r2_dq):
+                                                _r2_ci += 2; continue
+                                            if _r2_ch == '`':
+                                                _r2_ci += 1; continue
+                                            if not _r2_dq and _r2_ch == "'":
+                                                _r2_sq = not _r2_sq
+                                            elif not _r2_sq and _r2_ch == '"':
+                                                _r2_dq = not _r2_dq
+                                            _r2_ci += 1
+                                        _r2_unc = "'" if _r2_sq else '"' if _r2_dq else None
+                                        if _r2_unc:
+                                            _r2_lines[_r2_ln_idx] = _r2_raw + _r2_unc + '\n'
+                                            _tsx_src_r2 = ''.join(_r2_lines)
+                                            merged_blob["index.tsx"] = _tsx_src_r2
+                                            _r2_fixed = True
+                                            narrate("Juniper Ryle", f"TARGETED SYNTAX REPAIR (fallthrough guard): Force-closed unterminated {_r2_unc!r} on reported line {_r2_ln_idx + 1}.")
+                                if _r2_fixed:
+                                    _re_other = [e for e in _re_other if not e.startswith("SYNTAX_ERROR:")]
                             if _re_other and not _re_truly_unrecoverable:
                                 narrate("Dr. Mira Kessler", f"TSX SYNTAX REPAIR: Syntax fixed, handing off remaining recoverable errors to LAYOUT/UI repair: {_err2}")
                                 other_errors = _re_other
@@ -5251,6 +6009,10 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         _syn_repair_content = re.sub(r'\b127\.0\.0\.1:8001\b', '127.0.0.1:8000', _syn_repair_content)
                         if not any(ln.strip() == 'import os' for ln in _syn_repair_content.splitlines()):
                             _syn_repair_content = 'import os\n' + _syn_repair_content
+                        if not re.search(r'^\s*router\s*=\s*APIRouter\s*\(\)', _syn_repair_content, re.MULTILINE):
+                            _syn_repair_content = "from fastapi import APIRouter\nrouter = APIRouter()\n\n" + _syn_repair_content
+                        if not re.search(r'^\s*def\s+register\s*\(\s*\)\s*:', _syn_repair_content, re.MULTILINE):
+                            _syn_repair_content = _syn_repair_content.rstrip() + "\n\ndef register():\n    return router\n"
                         merged_blob["app.py"] = _syn_repair_content.strip()
                         narrate("Isaac Moreno", f"SYNTAX REPAIR: app.py regenerated ({len(_syn_repair_content)} chars). Re-validating...")
                         res3 = build_gate.process_build(module_name, json.dumps(merged_blob), task_prompt=prompt)
@@ -5271,7 +6033,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             # always died here even when the only outstanding
                             # error was a missing-route CONTRACT_ERROR (which
                             # has its own dedicated repair).
-                            _sr_known_pfx = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:|DATA_ERROR:|RUNTIME_ERROR:)'
+                            _sr_known_pfx = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:|DATA_ERROR:|RUNTIME_ERROR:|FIDELITY_ERROR:|DENSITY_ERROR:)'
                             _sr_re_err_list = [e.strip() for e in re.split(rf';\s*(?={_sr_known_pfx})', _err2) if e.strip()]
                             _sr_re_other = [e for e in _sr_re_err_list if not e.startswith("SKELETON:") and not e.startswith("SKELETON_VIEW:")]
                             _sr_re_truly_unrecoverable = [
@@ -5308,6 +6070,12 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
             missing_route_errors = [e for e in contract_errors_all if "fetches" in e and "no matching" in e]
             duplicate_route_errors_lui = [e for e in contract_errors_all if "duplicate route path" in e]
             lucide_namespace_errors = [e for e in contract_errors_all if "import * as Lucide" in e or "forbidden 'import * as Lucide'" in e]
+            apppy_boilerplate_errors = [e for e in contract_errors_all if "app.py missing" in e]
+            other_contract_errors = [e for e in contract_errors_all
+                                     if e not in missing_route_errors
+                                     and e not in duplicate_route_errors_lui
+                                     and e not in lucide_namespace_errors
+                                     and e not in apppy_boilerplate_errors]
             truly_unrecoverable = [e for e in other_errors
                                    if not e.startswith("LAYOUT_ERROR:")
                                    and not e.startswith("UI_ERROR:")
@@ -5316,7 +6084,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                    and not e.startswith("DATA_ERROR:")
                                    and not e.startswith("RUNTIME_ERROR:")
                                    and not e.startswith("CONTRACT_ERROR:")]
-            if (layout_errors or ui_errors or rules_errors or data_errors or runtime_errors or syntax_errors_lui or missing_route_errors or duplicate_route_errors_lui or lucide_namespace_errors) and not truly_unrecoverable:
+            if (layout_errors or ui_errors or rules_errors or data_errors or runtime_errors or syntax_errors_lui or missing_route_errors or duplicate_route_errors_lui or lucide_namespace_errors or apppy_boilerplate_errors or other_contract_errors) and not truly_unrecoverable:
                 _lui_tsx = merged_blob.get("index.tsx", "")
                 _lui_changed = False
 
@@ -5367,6 +6135,64 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         _lui_changed = True
                         narrate("Juniper Ryle", f"CONTRACT REPAIR (LUI): Rewrote forbidden Lucide namespace import to named imports ({len(_luc_uses)} icon(s)).")
 
+                # --- CONTRACT_ERROR (app.py missing boilerplate) deterministic repair ---
+                # Handles the case where the LLM generated a skeleton app.py missing one
+                # or more required declarations. Each fix is a targeted append/prepend —
+                # never rewriting the whole file.
+                if apppy_boilerplate_errors:
+                    _bpl_app = merged_blob.get("app.py", "")
+                    _bpl_changed = False
+                    if any("missing 'def register():" in e for e in apppy_boilerplate_errors):
+                        if not re.search(r'^\s*def\s+register\s*\(\s*\)\s*:', _bpl_app, re.MULTILINE):
+                            _bpl_app = _bpl_app.rstrip() + "\n\ndef register():\n    return router\n"
+                            _bpl_changed = True
+                            narrate("Isaac Moreno", "CONTRACT REPAIR: Appended missing `def register(): return router` to app.py.")
+                    if any("missing 'router = APIRouter()'" in e for e in apppy_boilerplate_errors):
+                        if not re.search(r'^\s*router\s*=\s*APIRouter\s*\(\)', _bpl_app, re.MULTILINE):
+                            _bpl_app = "from fastapi import APIRouter\nrouter = APIRouter()\n\n" + _bpl_app
+                            _bpl_changed = True
+                            narrate("Isaac Moreno", "CONTRACT REPAIR: Prepended missing `router = APIRouter()` to app.py.")
+                    if any("missing 'import os'" in e for e in apppy_boilerplate_errors):
+                        if "import os" not in _bpl_app:
+                            _bpl_app = "import os\n" + _bpl_app
+                            _bpl_changed = True
+                            narrate("Isaac Moreno", "CONTRACT REPAIR: Prepended missing `import os` to app.py.")
+                    if _bpl_changed:
+                        merged_blob["app.py"] = _bpl_app
+                        _lui_changed = True
+
+                # --- OTHER CONTRACT_ERROR deterministic repairs ---
+                # Handles contract errors that have no dedicated repair path above.
+                if other_contract_errors:
+                    if any("index.html missing" in e for e in other_contract_errors):
+                        _ihtml = merged_blob.get("index.html", "")
+                        if _ihtml and "/index.html" not in _ihtml:
+                            _dash_link = '<a href="/index.html" style="position:fixed;bottom:8px;right:8px;z-index:9999;background:#1a1a2e;color:#e2e8f0;padding:6px 12px;border-radius:6px;font-size:12px;text-decoration:none">&#8592; Dashboard</a>'
+                            if "</body>" in _ihtml:
+                                _ihtml = _ihtml.replace("</body>", f"{_dash_link}</body>")
+                            else:
+                                _ihtml += f"\n{_dash_link}"
+                            merged_blob["index.html"] = _ihtml
+                            _lui_changed = True
+                            narrate("Naomi Kade", "CONTRACT REPAIR: Injected missing return-to-dashboard link into index.html.")
+                    if any("forbidden dynamic ReactDOM import" in e for e in other_contract_errors):
+                        _rdx = _lui_tsx
+                        _rdx = re.sub(r"import\s*\(\s*['\"]react-dom/client['\"]\s*\)", "import ReactDOM from 'react-dom/client'", _rdx)
+                        _rdx = re.sub(r"import\s*\(\s*['\"]react-dom['\"]\s*\)", "import ReactDOM from 'react-dom/client'", _rdx)
+                        if _rdx != _lui_tsx:
+                            _lui_tsx = _rdx
+                            _lui_changed = True
+                            narrate("Juniper Ryle", "CONTRACT REPAIR: Replaced forbidden dynamic ReactDOM import with static import.")
+                    if any("calls local AI port 8001" in e for e in other_contract_errors):
+                        _p8_app = merged_blob.get("app.py", "")
+                        _p8_fixed = re.sub(r'https?://(?:localhost|127\.0\.0\.1):8001(/[^\s\'"]*)?', 'http://127.0.0.1:8000/api/chat/chat', _p8_app)
+                        _p8_fixed = re.sub(r'\blocalhost:8001\b', '127.0.0.1:8000', _p8_fixed)
+                        _p8_fixed = re.sub(r'\b127\.0\.0\.1:8001\b', '127.0.0.1:8000', _p8_fixed)
+                        if _p8_fixed != _p8_app:
+                            merged_blob["app.py"] = _p8_fixed
+                            _lui_changed = True
+                            narrate("Isaac Moreno", "CONTRACT REPAIR: Replaced local AI port 8001 references with main server endpoint.")
+
                 # --- DETERMINISTIC TSX SYNTAX REPAIR (line-targeted) ---
                 # When build_gate reports `SYNTAX_ERROR: index.tsx has an unterminated
                 # string literal at line N`, parse N and apply a surgical fix to that
@@ -5375,53 +6201,47 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                 # that survived (or were re-introduced after) the upstream syntax repair.
                 # Without it the build dies here on every otherwise-recoverable error set.
                 if syntax_errors_lui:
-                    _line_re = re.compile(r'unterminated string literal at line (\d+)', re.IGNORECASE)
-                    _lui_lines = _lui_tsx.splitlines(keepends=True)
-                    _syn_fixed = 0
-                    for _se in syntax_errors_lui:
-                        _m_ln = _line_re.search(_se)
-                        if not _m_ln:
-                            continue
-                        _ln_idx = int(_m_ln.group(1)) - 1
-                        if _ln_idx < 0 or _ln_idx >= len(_lui_lines):
-                            continue
-                        _bad = _lui_lines[_ln_idx]
-                        _stripped = _bad.rstrip('\r\n')
-                        # Find the LAST unescaped quote on the line and infer kind.
-                        _qs = _qd = _qt = False
-                        _last_q = -1
-                        _last_q_ch = None
-                        _i = 0
-                        while _i < len(_stripped):
-                            _ch = _stripped[_i]
-                            if _ch == '\\' and (_qs or _qd):
-                                _i += 2
+                    _has_nc_err = any("NULLISH COALESCING" in _se for _se in syntax_errors_lui)
+                    _has_str_err = any("unterminated string literal" in _se for _se in syntax_errors_lui)
+                    _syn_before = _lui_tsx
+                    if _has_nc_err or any("??" in _lui_tsx and "||" in _lui_tsx for _ in [1]):
+                        _lui_tsx = _fix_nullish_coalescing(_lui_tsx)
+                        if _lui_tsx != _syn_before:
+                            narrate("Juniper Ryle", f"SYNTAX REPAIR (lui): Parenthesized {len(_NC_COALESCING_RE.findall(_syn_before))} `?? value ||` operator-precedence expression(s).")
+                    if _has_str_err:
+                        _lui_tsx, _syn_fixed = _fix_unterminated_strings(_lui_tsx)
+                        if _syn_fixed:
+                            narrate("Juniper Ryle", f"SYNTAX REPAIR (lui): Closed {_syn_fixed} unterminated string(s) — full file scan with template-literal carry state.")
+                        # Targeted line-number repair for any SYNTAX_ERROR with a reported line number.
+                        # _fix_unterminated_strings may close the wrong line due to template-literal
+                        # carry divergence. Trust the build gate's specific line number and force-close
+                        # that exact line using a fresh isolated scan (no cross-line template state).
+                        for _lts_err in [e for e in syntax_errors_lui if 'unterminated string literal at line' in e]:
+                            _lts_m = re.search(r'unterminated string literal at line (\d+)', _lts_err)
+                            if not _lts_m:
                                 continue
-                            if _ch == '`':
-                                _qt = not _qt
-                            elif not _qt:
-                                if _ch == "'" and not _qd:
-                                    _qs = not _qs
-                                    if _qs:
-                                        _last_q = _i; _last_q_ch = "'"
-                                elif _ch == '"' and not _qs:
-                                    _qd = not _qd
-                                    if _qd:
-                                        _last_q = _i; _last_q_ch = '"'
-                            _i += 1
-                        if not (_qs or _qd) or _last_q < 0 or not _last_q_ch:
-                            continue
-                        _before = _stripped[:_last_q]
-                        _last_lt = _before.rfind('<')
-                        _last_gt = _before.rfind('>')
-                        _in_jsx_attr = _last_lt >= 0 and _last_lt > _last_gt
-                        _suffix = _last_q_ch + ('/>' if _in_jsx_attr else '')
-                        _eol = _bad[len(_stripped):] or '\n'
-                        _lui_lines[_ln_idx] = _stripped + _suffix + _eol
-                        _syn_fixed += 1
-                        narrate("Juniper Ryle", f"SYNTAX REPAIR (line-targeted): Closed unterminated {_last_q_ch} on line {_ln_idx + 1}{' and self-closed JSX tag' if _in_jsx_attr else ''}.")
-                    if _syn_fixed:
-                        _lui_tsx = ''.join(_lui_lines)
+                            _lts_ln_idx = int(_lts_m.group(1)) - 1
+                            _lts_lines = _lui_tsx.splitlines(keepends=True)
+                            if 0 <= _lts_ln_idx < len(_lts_lines):
+                                _lts_raw = _lts_lines[_lts_ln_idx].rstrip('\r\n')
+                                _lts_in_sq = False; _lts_in_dq = False; _lts_ci = 0
+                                while _lts_ci < len(_lts_raw):
+                                    _lts_ch = _lts_raw[_lts_ci]
+                                    if _lts_ch == '\\' and (_lts_in_sq or _lts_in_dq):
+                                        _lts_ci += 2; continue
+                                    if _lts_ch == '`':
+                                        _lts_ci += 1; continue
+                                    if not _lts_in_dq and _lts_ch == "'":
+                                        _lts_in_sq = not _lts_in_sq
+                                    elif not _lts_in_sq and _lts_ch == '"':
+                                        _lts_in_dq = not _lts_in_dq
+                                    _lts_ci += 1
+                                _lts_unclosed = "'" if _lts_in_sq else '"' if _lts_in_dq else None
+                                if _lts_unclosed:
+                                    _lts_lines[_lts_ln_idx] = _lts_raw + _lts_unclosed + '\n'
+                                    _lui_tsx = ''.join(_lts_lines)
+                                    narrate("Juniper Ryle", f"TARGETED SYNTAX REPAIR (lui): Force-closed unterminated {_lts_unclosed!r} on reported line {_lts_ln_idx + 1}.")
+                    if _lui_tsx != _syn_before:
                         _lui_changed = True
 
                 if duplicate_route_errors_lui:
@@ -5601,6 +6421,13 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             _lui_tsx = _ui_repair_content
                             _lui_changed = True
                             narrate("Juniper Ryle", f"UI REPAIR: Span-as-tab patch applied ({len(_ui_repair_content)} chars).")
+                            _ui_nc_before = _lui_tsx
+                            _lui_tsx = _fix_nullish_coalescing(_lui_tsx)
+                            if _lui_tsx != _ui_nc_before:
+                                narrate("Juniper Ryle", f"UI REPAIR: Post-patch — parenthesized {len(_NC_COALESCING_RE.findall(_ui_nc_before))} `?? value ||` expression(s).")
+                            _lui_tsx, _ui_str_count = _fix_unterminated_strings(_lui_tsx)
+                            if _ui_str_count:
+                                narrate("Juniper Ryle", f"UI REPAIR: Post-patch — closed {_ui_str_count} unterminated string(s).")
                         else:
                             narrate("Juniper Ryle", "UI REPAIR: LLM returned suspiciously short content — skipping span-as-tab patch.")
 
@@ -5658,6 +6485,10 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             if _mr_skeleton_hit:
                                 narrate("Isaac Moreno", f"MISSING ROUTE REPAIR: Rejecting LLM patch — contains skeleton token '{_mr_skeleton_hit.group()}' that would fail SKELETON validation.")
                             elif len(_mr_content) >= len(_mr_app_py) * 0.8:
+                                if not re.search(r'^\s*router\s*=\s*APIRouter\s*\(\)', _mr_content, re.MULTILINE):
+                                    _mr_content = "from fastapi import APIRouter\nrouter = APIRouter()\n\n" + _mr_content
+                                if not re.search(r'^\s*def\s+register\s*\(\s*\)\s*:', _mr_content, re.MULTILINE):
+                                    _mr_content = _mr_content.rstrip() + "\n\ndef register():\n    return router\n"
                                 merged_blob["app.py"] = _mr_content
                                 _lui_changed = True
                                 narrate("Isaac Moreno", f"MISSING ROUTE REPAIR: app.py patched with {len(_missing_paths)} route(s).")
@@ -5673,7 +6504,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                 #  TIER B — Generic JS/TS structural fixes (brace-matching, scope
                 #           rewrites) that cannot be expressed as a single regex_sub.
                 #           These remain inline below.
-                if rules_errors:
+                if rules_errors or data_errors or runtime_errors:
                     _det_fixed_kinds = []
 
                     # ── TIER A: registry-driven pattern repairs ────────────────
@@ -5696,7 +6527,8 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         _sig = _entry.get("error_signature", "")
                         if not _sig:
                             continue
-                        _matching = [e for e in rules_errors if _sig in e]
+                        _all_repair_errors = rules_errors + data_errors + runtime_errors
+                        _matching = [e for e in _all_repair_errors if _sig in e]
                         if not _matching:
                             continue
                         _tgt = _entry.get("target_file", "index.tsx")
@@ -5731,8 +6563,10 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             _msg = f"RULES REPAIR (registry): Applied {_n} fix(es) [{_entry.get('id', '?')}]. (template key error: {_fmt_err})"
                         narrate(_persona, _msg)
                         for _e in _matching:
-                            if _e in rules_errors:
-                                rules_errors.remove(_e)
+                            for _err_lst in (rules_errors, data_errors, runtime_errors):
+                                if _e in _err_lst:
+                                    _err_lst.remove(_e)
+                                    break
                         _det_fixed_kinds.append(_entry.get("id", "REGISTRY_FIX"))
 
                     # FIX 2: getCurrentPosition() called without timeout options arg.
@@ -5957,7 +6791,9 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                     # Extract the route path from the error message dynamically so this
                     # fix applies to ANY route, not just /precursor/analysis.
                     # Inject a useEffect that calls the existing fetch helper on mount.
-                    _prec_errors = [e for e in rules_errors if "AUTO-LOAD MANDATE" in e]
+                    # NOTE: Some mandate names use "AUTOLOAD MANDATE" (no hyphen) while
+                    # others use "AUTO-LOAD MANDATE" (hyphenated). Both forms must match.
+                    _prec_errors = [e for e in rules_errors if "AUTO-LOAD MANDATE" in e or "AUTOLOAD MANDATE" in e]
                     _prec_route = None
                     for _pe_txt in _prec_errors:
                         # Pattern 1: tsx_autoload errors — "`/path` is fetched ONLY"
@@ -5991,17 +6827,34 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             _ph_name = _prec_handler_m.group(1)
                             # Inject comment containing the route path so the
                             # build_gate autoload_patterns regex can match it.
+                            # Use useEffect (not React.useEffect) to avoid requiring
+                            # React default import when only named imports are present.
                             _prec_effect_snippet = (
-                                f"\n  React.useEffect(() => {{ "
+                                f"\n  useEffect(() => {{ "
                                 f"/* AUTO-LOAD {_prec_route} on mount */ "
                                 f"{_ph_name}(); }}, []);\n"
                             )
                             _hd_end = _prec_handler_m.end()
-                            _blank_after = _lui_tsx.find('\n\n', _hd_end)
-                            if _blank_after < 0:
-                                _blank_after = _lui_tsx.find(';\n', _hd_end)
-                            if _blank_after > 0:
-                                _lui_tsx_candidate = _lui_tsx[:_blank_after] + _prec_effect_snippet + _lui_tsx[_blank_after:]
+                            # Find injection point: look for the NEXT top-level return( or
+                            # useEffect( or const [A-Z] that follows the handler — this is
+                            # a component-level statement boundary, NOT a blank line inside
+                            # the function body. Injecting at the first \n\n risks landing
+                            # inside the function's own body if it has an empty line.
+                            _inject_pos = -1
+                            _boundary_re = re.compile(
+                                r'\n(?=\s{0,4}(?:useEffect|return\s*[(\(]|const\s+[A-Z]|\};?\s*$))',
+                                re.MULTILINE
+                            )
+                            _bm = _boundary_re.search(_lui_tsx, _hd_end)
+                            if _bm:
+                                _inject_pos = _bm.start()
+                            if _inject_pos < 0:
+                                # Fallback: first blank line after handler end
+                                _inject_pos = _lui_tsx.find('\n\n', _hd_end)
+                            if _inject_pos < 0:
+                                _inject_pos = _lui_tsx.find(';\n', _hd_end)
+                            if _inject_pos > 0:
+                                _lui_tsx_candidate = _lui_tsx[:_inject_pos] + _prec_effect_snippet + _lui_tsx[_inject_pos:]
                                 # POST-REPAIR VERIFICATION: route appears inside a useEffect.
                                 _verify_prec = re.search(
                                     rf"useEffect[\s\S]{{0,500}}?{re.escape(_prec_route)}",
@@ -6058,6 +6911,101 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                         else:
                             narrate("Juniper Ryle", "RULES REPAIR (deterministic): RECHARTS HEIGHT error fired but no uncovered <ResponsiveContainer> found — leaving for LLM patch.")
 
+                    # FIX 6: PATTERN STUDIO PERSONA ITERATION MANDATE
+                    # Fires when Pattern Studio topology lacks domainPersonas.map() / personas.map().
+                    # Generic: persona names come from extracted_personas (built during this build
+                    # session) — NEVER hardcoded per NO MODULE-SPECIFIC HARDCODES IN CORE (rules.md).
+                    _ps_iter_errors = [e for e in rules_errors if "PATTERN STUDIO PERSONA ITERATION MANDATE" in e]
+                    if _ps_iter_errors and extracted_personas:
+                        _ps_tsx = _lui_tsx
+                        _ps_entries = [
+                            '{name: ' + json.dumps(p.get('name', '')) + ', role: ' + json.dumps(p.get('role', '')) + '}'
+                            for p in extracted_personas
+                        ]
+                        _ps_decl_str = 'const domainPersonas = [' + ', '.join(_ps_entries) + '];'
+                        _ps_guard_already = re.search(
+                            r'\bdomainPersonas\b|\bpersonaNodes\s*=\s*\[|\bpersonas\.map\b'
+                            r'|\bpersonaList\s*\.map\b|\bnodes\.map\b|\ballPersonas\s*\.map\b',
+                            _ps_tsx, re.IGNORECASE
+                        )
+                        if not _ps_guard_already:
+                            _ps_trig = next(
+                                (t for t in ['SYNTHESIS CORE', 'Pattern Studio', 'PatternStudio', 'Convergence Topology']
+                                 if t in _ps_tsx), None
+                            )
+                            if _ps_trig:
+                                _ps_anchor = _ps_tsx.find(_ps_trig)
+                                # Find the enclosing component function by scanning backwards
+                                _ps_fn_m = None
+                                for _fn_pat in [
+                                    r'const\s+[A-Z]\w*\s*(?::\s*React\.FC[^=]*)?\s*=\s*(?:async\s*)?\(\s*\)\s*=>\s*\{',
+                                    r'function\s+[A-Z]\w*\s*\([^)]*\)\s*\{',
+                                ]:
+                                    _fn_candidates = list(re.finditer(_fn_pat, _ps_tsx[:_ps_anchor]))
+                                    if _fn_candidates:
+                                        _ps_fn_m = _fn_candidates[-1]
+                                        break
+                                if _ps_fn_m:
+                                    _ps_fn_body_start = _ps_fn_m.end()
+                                    _ps_tsx = (
+                                        _ps_tsx[:_ps_fn_body_start]
+                                        + '\n  ' + _ps_decl_str + '\n'
+                                        + _ps_tsx[_ps_fn_body_start:]
+                                    )
+                                    _ps_anchor += len('\n  ' + _ps_decl_str + '\n')
+                                else:
+                                    _ps_tsx = _ps_decl_str + '\n' + _ps_tsx
+                                    _ps_anchor += len(_ps_decl_str) + 1
+                                # Find topology container closing tag and inject domainPersonas.map()
+                                _ps_win = _ps_tsx[_ps_anchor: _ps_anchor + 12000]
+                                _ps_svg_m = re.search(r'</svg>', _ps_win)
+                                _ps_is_svg = _ps_svg_m is not None
+                                _ps_close_rel = _ps_svg_m.start() if _ps_svg_m else -1
+                                if _ps_close_rel < 0:
+                                    _ps_div_m = re.search(r'</div>', _ps_win)
+                                    _ps_close_rel = _ps_div_m.start() if _ps_div_m else -1
+                                if _ps_close_rel >= 0:
+                                    _ps_abs_close = _ps_anchor + _ps_close_rel
+                                    if _ps_is_svg:
+                                        _ps_nodes = (
+                                            '\n{domainPersonas.map((persona, i) => {'
+                                            ' const angle = (i / domainPersonas.length) * 2 * Math.PI;'
+                                            ' const r = 160;'
+                                            ' const nx = 250 + Math.cos(angle - Math.PI / 2) * r;'
+                                            ' const ny = 250 + Math.sin(angle - Math.PI / 2) * r;'
+                                            ' return (<g key={persona.name} transform={`translate(${nx}, ${ny})`}'
+                                            ' style={{cursor:"pointer"}}>'
+                                            '<circle r={22} fill="#1e293b" stroke="#3b82f6" strokeWidth={2}/>'
+                                            '<text textAnchor="middle" dy={4} fill="#94a3b8" fontSize={9}>'
+                                            '{persona.name.split(" ").slice(-1)[0]}'
+                                            '</text></g>);})}' + '\n'
+                                        )
+                                    else:
+                                        _ps_nodes = (
+                                            '\n{domainPersonas.map((persona, i) => {'
+                                            ' const angle = (i / domainPersonas.length) * 2 * Math.PI;'
+                                            ' const r = 160;'
+                                            ' return (<div key={persona.name}'
+                                            ' style={{position:"absolute",'
+                                            'left:`calc(50% + ${Math.cos(angle - Math.PI/2) * r}px)`,'
+                                            'top:`calc(50% + ${Math.sin(angle - Math.PI/2) * r}px)`,'
+                                            'transform:"translate(-50%,-50%)",background:"#1e293b",'
+                                            'border:"2px solid #3b82f6",borderRadius:"50%",'
+                                            'width:44,height:44,display:"flex",alignItems:"center",'
+                                            'justifyContent:"center",cursor:"pointer"}}>'
+                                            '<span style={{fontSize:8,color:"#94a3b8",textAlign:"center"}}>'
+                                            '{persona.name.split(" ").slice(-1)[0]}'
+                                            '</span></div>);})}' + '\n'
+                                        )
+                                    _ps_tsx = _ps_tsx[:_ps_abs_close] + _ps_nodes + _ps_tsx[_ps_abs_close:]
+                                    _lui_tsx = _ps_tsx
+                                    _lui_changed = True
+                                    for _e in list(_ps_iter_errors):
+                                        if _e in rules_errors:
+                                            rules_errors.remove(_e)
+                                    _det_fixed_kinds.append('PATTERN_STUDIO_PERSONA_ITER')
+                                    narrate("Juniper Ryle", f"RULES REPAIR (deterministic): Injected domainPersonas.map() with {len(_ps_entries)} persona node(s) into Pattern Studio topology.")
+
                     if _det_fixed_kinds:
                         narrate("Juniper Ryle", f"RULES REPAIR (deterministic): Resolved {len(_det_fixed_kinds)} rule(s) without LLM: {_det_fixed_kinds}. Remaining for LLM: {len(rules_errors)}.")
 
@@ -6076,7 +7024,7 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             _verify_res = None
                         if _verify_res and not _verify_res.get("success"):
                             _vd = _verify_res.get("details", "")
-                            _known_pfx_v = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:|DATA_ERROR:|RUNTIME_ERROR:)'
+                            _known_pfx_v = r'(?:SKELETON(?:_VIEW)?:|CONTRACT_ERROR:|LAYOUT_ERROR:|UI_ERROR:|SYNTAX_ERROR:|RULES_COMPLIANCE:|DATA_ERROR:|RUNTIME_ERROR:|FIDELITY_ERROR:|DENSITY_ERROR:)'
                             _v_split = [e.strip() for e in re.split(rf';\s*(?={_known_pfx_v})', _vd) if e.strip()]
                             _still_rules = [e for e in _v_split if e.startswith("RULES_COMPLIANCE:")]
                             _still_data = [e for e in _v_split if e.startswith("DATA_ERROR:")]
@@ -6088,105 +7036,100 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             data_errors[:] = _still_data
                             runtime_errors[:] = _still_runtime
 
-                # --- RULES_COMPLIANCE / DATA_ERROR / RUNTIME_ERROR auto-fix: LLM TSX patch ---
-                # These errors require a targeted TSX rewrite. RULES_COMPLIANCE covers
-                # star-map imagery, recharts height, and geocoding rules. DATA_ERROR covers
-                # synthetic grid markers and temporal-frames gaps. RUNTIME_ERROR covers the
-                # Leaflet useEffect-on-conditional-ref (Invariant failed) pattern.
-                # NOTE: intentionally NOT gated on `not _lui_changed`. Prior LAYOUT/UI/MISSING-ROUTE
-                # repairs may have already patched the TSX (setting _lui_changed=True), but that does
-                # NOT mean RULES/DATA/RUNTIME errors were addressed — they need their own LLM pass.
-                # Always run this repair when these error types are present, using the latest _lui_tsx
-                # (which may already incorporate LAYOUT/UI fixes from earlier in this block).
+                # --- DETERMINISTIC REPAIR: undeclared module-level cache dicts ---
+                # build_gate._check_undeclared_module_dicts emits DATA_ERROR entries with
+                # the signature "UNDECLARED MODULE-LEVEL DICT 'name'". Inject the missing
+                # module-scope initialization deterministically — no LLM needed for this.
+                # Pattern: `name = {"result": None, "timestamp": 0, "running": False}`
+                # inserted immediately before the first @router decorator in app.py.
+                _undecl_dict_errors = [e for e in data_errors if "UNDECLARED MODULE-LEVEL DICT" in e]
+                if _undecl_dict_errors:
+                    _ud_app = merged_blob.get("app.py", "")
+                    _ud_changed = False
+                    for _ud_err in _undecl_dict_errors:
+                        _ud_name_m = re.search(r"UNDECLARED MODULE-LEVEL DICT '([^']+)'", _ud_err)
+                        if not _ud_name_m:
+                            continue
+                        _ud_name = _ud_name_m.group(1)
+                        _ud_decl_re = re.compile(rf'^\s*{re.escape(_ud_name)}\s*=', re.MULTILINE)
+                        if _ud_decl_re.search(_ud_app):
+                            data_errors.remove(_ud_err)
+                            continue
+                        _ud_inject = f'{_ud_name} = {{"result": None, "timestamp": 0, "running": False}}\n'
+                        _ud_router_m = re.search(r'^@router\.', _ud_app, re.MULTILINE)
+                        if _ud_router_m:
+                            _ud_app = _ud_app[:_ud_router_m.start()] + _ud_inject + _ud_app[_ud_router_m.start():]
+                        else:
+                            _ud_app = _ud_app.rstrip() + f"\n\n{_ud_inject}"
+                        _ud_changed = True
+                        data_errors.remove(_ud_err)
+                        narrate("Isaac Moreno", f"DETERMINISTIC REPAIR: Injected missing module-scope `{_ud_inject.strip()}` — prevents NameError 500 on every request.")
+                    if _ud_changed:
+                        merged_blob["app.py"] = _ud_app
+                        _lui_changed = True
+
+                # --- RULES_COMPLIANCE / DATA_ERROR / RUNTIME_ERROR auto-fix: LLM file patch ---
+                # These errors require targeted rewrites. Errors are split by target file:
+                #   - Backend errors (DATA_ERROR about routes, missing API calls in app.py)
+                #     → send numbered app.py, apply patches to app.py
+                #   - Frontend errors (RULES_COMPLIANCE UI patterns, RUNTIME_ERROR)
+                #     → send numbered index.tsx, apply patches to index.tsx
+                # Sending the wrong file to the LLM is the root cause of persistent repair
+                # failures: the LLM cannot fix a backend route when it is only shown index.tsx.
                 _llm_repair_errors = rules_errors + data_errors + runtime_errors
                 if _llm_repair_errors:
-                    _llm_repair_detail = "; ".join(_llm_repair_errors)
                     narrate("Juniper Ryle", f"RULES/DATA/RUNTIME REPAIR: Requesting LLM line-patch for {len(_llm_repair_errors)} error(s)...")
 
-                    # SMART REPAIR PROTOCOL — JSON LINE-PATCH FORMAT
-                    # Old approach: ask the model to rewrite the entire 100KB+ index.tsx
-                    # to add 1-2 lines. The output stream alone took 60-200s and burned
-                    # the model's thinking budget on regurgitating untouched code, often
-                    # ending in a thinking-loop timeout and multi-model failover.
-                    #
-                    # New approach: send a NUMBERED SLICE of the file with surrounding
-                    # context, ask the model to return only a JSON list of line edits:
-                    #   [{"line": N, "action": "replace"|"insert_after"|"delete", "text": "..."}, ...]
-                    # Output payload drops from ~100KB to ~1-3KB per error, eliminating
-                    # the thinking-loop and producing the patch in <30s on the cheap model.
-                    _lui_lines_for_patch = _lui_tsx.splitlines()
-                    _numbered_full = "\n".join(
-                        f"{_li + 1:5d}: {_lt}" for _li, _lt in enumerate(_lui_lines_for_patch)
+                    # Heuristic: classify each error by the file it targets.
+                    # Backend signals: route paths, "route does not", "route has no",
+                    # "does not fetch", "does not return", "@router", "app.py".
+                    _BACKEND_SIGNALS = (
+                        "the /", "route does not", "route has no", "does not fetch",
+                        "does not return", "does not include", "does not parse",
+                        "@router", "app.py", "httpexception", "python syntax",
+                        "fetch from noaa", "fetch from usgs", "concurrent fetch",
+                        "api call does not", "does not use the global",
+                        "does not call", "missing from the route", "backend route",
                     )
-                    # Cap context so we never blow the 200K-token model window.
-                    if len(_numbered_full) > 90000:
-                        _numbered_full = _numbered_full[:90000] + "\n... [TRUNCATED — operate only on visible lines]"
+                    def _is_backend_err(e):
+                        if "[app.py]" in e:
+                            return True
+                        el = e.lower()
+                        return any(sig in el for sig in _BACKEND_SIGNALS)
 
-                    _rules_repair_prompt = (
-                        "OUTPUT ONLY A JSON ARRAY. NO prose, NO markdown fences, NO explanations.\n\n"
-                        "TSX LINE-PATCH REPAIR — minimal targeted edits only.\n"
-                        "Errors to fix (one or more):\n"
-                        f"{_llm_repair_detail}\n\n"
-                        "RESPONSE FORMAT — a single JSON array, each element an edit object:\n"
-                        '  {"line": <1-based line number>, "action": "replace", "text": "<new full line content, no trailing newline>"}\n'
-                        '  {"line": <1-based line number>, "action": "insert_after", "text": "<line(s) to insert AFTER the given line>"}\n'
-                        '  {"line": <1-based line number>, "action": "delete"}\n'
-                        "Multiple lines in one `text` field are allowed (use \\n).\n"
-                        "Return ONLY the edits required to fix the listed error(s) — typically 1-5 edits.\n"
-                        "Do NOT return the full file. Do NOT wrap in markdown. Do NOT add commentary.\n"
-                        "If no fix is possible, return [].\n\n"
-                        "CURRENT index.tsx (numbered):\n"
-                        f"{_numbered_full}"
+                    _backend_llm_errors = [e for e in _llm_repair_errors if _is_backend_err(e)]
+                    _frontend_llm_errors = [e for e in _llm_repair_errors if not _is_backend_err(e)]
+
+                    _skel_re = re.compile(
+                        r'\bTODO:|\bFIXME:|implementation\s*here|implementation pending|'
+                        r'(?://|#)\s*Placeholder\b|<div[^>]*>\s*Placeholder\s*</div>|\bmock_|example\.com',
+                        re.IGNORECASE,
                     )
-                    # thinking_level=none + small JSON output = sub-30s wall time.
-                    _rules_res = await call_llm_async(
-                        config.GEMINI_MODEL_31_CUSTOMTOOLS, _rules_repair_prompt,
-                        system_instruction=marcus_system_instruction,
-                        max_tokens=8192,
-                        persona_name="Juniper Ryle", history=None,
-                        blocked_models=BUILD_BLOCKED_MODELS,
-                        disable_search=True,
-                        thinking_level="none"
-                    )
-                    _rules_content = (_rules_res.get("text") or "").strip()
 
-                    # Strip optional code fences.
-                    if _rules_content.startswith("```"):
-                        _rules_content = re.sub(r'^```(?:json)?\s*', '', _rules_content)
-                        _rules_content = re.sub(r'\s*```$', '', _rules_content).strip()
-
-                    _patch_edits = None
-                    if _rules_content:
-                        # Locate the JSON array even if the model added stray text.
-                        _arr_start = _rules_content.find('[')
-                        _arr_end = _rules_content.rfind(']')
-                        if _arr_start >= 0 and _arr_end > _arr_start:
-                            _arr_text = _rules_content[_arr_start:_arr_end + 1]
-                            try:
-                                _patch_edits = json.loads(_arr_text)
-                            except Exception as _je:
-                                narrate("Juniper Ryle", f"RULES/DATA/RUNTIME REPAIR: Failed to parse JSON line-patch ({_je}). Skipping.")
-
-                    if isinstance(_patch_edits, list) and _patch_edits:
-                        # Apply edits in REVERSE line order so earlier line numbers
-                        # remain valid after later inserts/deletes.
-                        _patch_lines = list(_lui_lines_for_patch)
+                    def _apply_json_patch(numbered_src, src_lines, edits_json, file_label):
+                        """Parse LLM JSON output and apply line-edits. Returns (new_text, applied, rejected)."""
+                        _content = (edits_json or "").strip()
+                        if _content.startswith("```"):
+                            _content = re.sub(r'^```(?:json)?\s*', '', _content)
+                            _content = re.sub(r'\s*```$', '', _content).strip()
+                        _arr_s = _content.find('[')
+                        _arr_e = _content.rfind(']')
+                        if _arr_s < 0 or _arr_e <= _arr_s:
+                            return None, 0, 0
+                        try:
+                            _edits = json.loads(_content[_arr_s:_arr_e + 1])
+                        except Exception:
+                            return None, 0, 0
+                        if not isinstance(_edits, list) or not _edits:
+                            return None, 0, 0
+                        _patch_lines = list(src_lines)
                         _applied = 0
                         _rejected = 0
-                        try:
-                            _sorted_edits = sorted(
-                                [e for e in _patch_edits if isinstance(e, dict) and isinstance(e.get("line"), int)],
-                                key=lambda e: e["line"], reverse=True,
-                            )
-                        except Exception:
-                            _sorted_edits = []
-                        # Skeleton-token guard for any inserted/replaced text.
-                        _skel_re = re.compile(
-                            r'\bTODO:|\bFIXME:|implementation\s*here|implementation pending|'
-                            r'(?://|#)\s*Placeholder\b|<div[^>]*>\s*Placeholder\s*</div>|\bmock_|example\.com',
-                            re.IGNORECASE,
+                        _sorted = sorted(
+                            [e for e in _edits if isinstance(e, dict) and isinstance(e.get("line"), int)],
+                            key=lambda e: e["line"], reverse=True,
                         )
-                        for _ed in _sorted_edits:
+                        for _ed in _sorted:
                             _ln = _ed.get("line", 0)
                             _act = _ed.get("action", "")
                             _txt = _ed.get("text", "") or ""
@@ -6201,37 +7144,110 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                 _patch_lines[_idx] = _txt
                                 _applied += 1
                             elif _act == "insert_after":
-                                # Allow multiline text via \n inside the JSON value.
-                                _ins = _txt.split("\n")
-                                _patch_lines[_idx + 1:_idx + 1] = _ins
+                                _patch_lines[_idx + 1:_idx + 1] = _txt.split("\n")
                                 _applied += 1
                             elif _act == "delete":
                                 del _patch_lines[_idx]
                                 _applied += 1
                             else:
                                 _rejected += 1
-                        if _applied:
-                            _lui_tsx = "\n".join(_patch_lines)
+                        return "\n".join(_patch_lines), _applied, _rejected
+
+                    def _build_patch_prompt(file_label, numbered_content, errors_detail):
+                        return (
+                            "OUTPUT ONLY A JSON ARRAY. NO prose, NO markdown fences, NO explanations.\n\n"
+                            f"{file_label.upper()} LINE-PATCH REPAIR — minimal targeted edits only.\n"
+                            "Errors to fix:\n"
+                            f"{errors_detail}\n\n"
+                            "RESPONSE FORMAT — a single JSON array, each element an edit object:\n"
+                            '  {"line": <1-based line number>, "action": "replace", "text": "<new full line content>"}\n'
+                            '  {"line": <1-based line number>, "action": "insert_after", "text": "<line(s) to insert AFTER the given line, use \\n for multiline>"}\n'
+                            '  {"line": <1-based line number>, "action": "delete"}\n'
+                            "Return ONLY the minimal edits required — typically 1-10 edits.\n"
+                            "Do NOT return the full file. Do NOT wrap in markdown. Do NOT add commentary.\n"
+                            "If no fix is possible, return [].\n\n"
+                            f"CURRENT {file_label} (numbered):\n"
+                            f"{numbered_content}"
+                        )
+
+                    def _number_file(text, cap=300000):
+                        lines = text.splitlines()
+                        numbered = "\n".join(f"{i + 1:5d}: {ln}" for i, ln in enumerate(lines))
+                        if len(numbered) > cap:
+                            numbered = numbered[:cap] + "\n... [TRUNCATED — operate only on visible lines]"
+                        return lines, numbered
+
+                    # ── BACKEND REPAIR PASS (app.py) ──────────────────────────
+                    if _backend_llm_errors:
+                        _app_py_src = merged_blob.get("app.py", "")
+                        _app_lines, _app_numbered = _number_file(_app_py_src)
+                        _be_detail = "; ".join(_backend_llm_errors)
+                        _be_prompt = _build_patch_prompt("app.py", _app_numbered, _be_detail)
+                        narrate("Isaac Moreno", f"RULES/DATA REPAIR (backend): Sending app.py to LLM for {len(_backend_llm_errors)} backend error(s).")
+                        _be_res = await call_llm_async(
+                            config.GEMINI_MODEL_31_CUSTOMTOOLS, _be_prompt,
+                            system_instruction=marcus_system_instruction,
+                            max_tokens=8192,
+                            persona_name="Isaac Moreno", history=None,
+                            blocked_models=BUILD_BLOCKED_MODELS,
+                            disable_search=True,
+                            thinking_level="none"
+                        )
+                        _be_patched, _be_applied, _be_rejected = _apply_json_patch(
+                            _app_numbered, _app_lines, _be_res.get("text", ""), "app.py"
+                        )
+                        if _be_applied and _be_patched:
+                            merged_blob["app.py"] = _be_patched
                             _lui_changed = True
-                            narrate("Juniper Ryle", f"RULES/DATA/RUNTIME REPAIR: Applied {_applied} line-edit(s) ({_rejected} rejected).")
+                            narrate("Isaac Moreno", f"RULES/DATA REPAIR (backend): Applied {_be_applied} line-edit(s) to app.py ({_be_rejected} rejected).")
                         else:
-                            narrate("Juniper Ryle", "RULES/DATA/RUNTIME REPAIR: All proposed edits rejected — leaving file unchanged.")
-                    elif _rules_content:
-                        # Fall back to legacy full-file replacement ONLY if model returned
-                        # a complete file-shaped payload (sanity-checked by length).
-                        if len(_rules_content) > len(_lui_tsx) * 0.7 and "import" in _rules_content[:2000]:
-                            if not re.search(
-                                r'\bTODO:|\bFIXME:|implementation\s*here|implementation pending|'
-                                r'(?://|#)\s*Placeholder\b|<div[^>]*>\s*Placeholder\s*</div>|\bmock_|example\.com',
-                                _rules_content, re.IGNORECASE,
-                            ):
-                                _lui_tsx = _rules_content
-                                _lui_changed = True
-                                narrate("Juniper Ryle", f"RULES/DATA/RUNTIME REPAIR: Fallback full-file replacement ({len(_rules_content)} chars).")
-                            else:
-                                narrate("Juniper Ryle", "RULES/DATA/RUNTIME REPAIR: Fallback rejected — contains skeleton tokens.")
+                            narrate("Isaac Moreno", f"RULES/DATA REPAIR (backend): No applicable edits returned for app.py ({_be_rejected} rejected).")
+
+                    # ── FRONTEND REPAIR PASS (index.tsx) ──────────────────────
+                    if _frontend_llm_errors:
+                        _fe_lines, _fe_numbered = _number_file(_lui_tsx)
+                        _fe_detail = "; ".join(_frontend_llm_errors)
+                        _fe_prompt = _build_patch_prompt("index.tsx", _fe_numbered, _fe_detail)
+                        narrate("Juniper Ryle", f"RULES/DATA REPAIR (frontend): Sending index.tsx to LLM for {len(_frontend_llm_errors)} frontend error(s).")
+                        _fe_res = await call_llm_async(
+                            config.GEMINI_MODEL_31_CUSTOMTOOLS, _fe_prompt,
+                            system_instruction=marcus_system_instruction,
+                            max_tokens=8192,
+                            persona_name="Juniper Ryle", history=None,
+                            blocked_models=BUILD_BLOCKED_MODELS,
+                            disable_search=True,
+                            thinking_level="none"
+                        )
+                        _fe_patched, _fe_applied, _fe_rejected = _apply_json_patch(
+                            _fe_numbered, _fe_lines, _fe_res.get("text", ""), "index.tsx"
+                        )
+                        _fe_tsx_changed = False
+                        if _fe_applied and _fe_patched:
+                            _lui_tsx = _fe_patched
+                            _lui_changed = True
+                            _fe_tsx_changed = True
+                            narrate("Juniper Ryle", f"RULES/DATA REPAIR (frontend): Applied {_fe_applied} line-edit(s) to index.tsx ({_fe_rejected} rejected).")
                         else:
-                            narrate("Juniper Ryle", "RULES/DATA/RUNTIME REPAIR: LLM returned non-JSON, non-file payload — skipping.")
+                            narrate("Juniper Ryle", f"RULES/DATA REPAIR (frontend): No applicable edits returned for index.tsx ({_fe_rejected} rejected).")
+                            # Fallback: if LLM returned a full file payload
+                            _fe_raw = (_fe_res.get("text") or "").strip()
+                            if _fe_raw.startswith("```"):
+                                _fe_raw = re.sub(r'^```(?:[\w]*)?\n?', '', _fe_raw)
+                                _fe_raw = re.sub(r'\n?```$', '', _fe_raw).strip()
+                            if len(_fe_raw) > len(_lui_tsx) * 0.7 and "import" in _fe_raw[:2000]:
+                                if not _skel_re.search(_fe_raw):
+                                    _lui_tsx = _fe_raw
+                                    _lui_changed = True
+                                    _fe_tsx_changed = True
+                                    narrate("Juniper Ryle", f"RULES/DATA REPAIR (frontend): Fallback full-file replacement ({len(_fe_raw)} chars).")
+                        if _fe_tsx_changed:
+                            _fe_nc_before = _lui_tsx
+                            _lui_tsx = _fix_nullish_coalescing(_lui_tsx)
+                            if _lui_tsx != _fe_nc_before:
+                                narrate("Juniper Ryle", f"RULES/DATA REPAIR (frontend): Post-patch — parenthesized {len(_NC_COALESCING_RE.findall(_fe_nc_before))} `?? value ||` expression(s).")
+                            _lui_tsx, _fe_str_count = _fix_unterminated_strings(_lui_tsx)
+                            if _fe_str_count:
+                                narrate("Juniper Ryle", f"RULES/DATA REPAIR (frontend): Post-patch — closed {_fe_str_count} unterminated string(s).")
 
                 if _lui_changed:
                     merged_blob["index.tsx"] = _lui_tsx
@@ -6302,6 +7318,47 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                             _sp_tsx = _sp_fixed
                             narrate("Dr. Mira Kessler", "SECOND-PASS REPAIR: Applied h-screen -> min-h-screen regex fix again.")
 
+                        _sp_nc_before = _sp_tsx
+                        _sp_tsx = _fix_nullish_coalescing(_sp_tsx)
+                        if _sp_tsx != _sp_nc_before:
+                            merged_blob["index.tsx"] = _sp_tsx
+                            narrate("Dr. Mira Kessler", f"SECOND-PASS REPAIR: Parenthesized {len(_NC_COALESCING_RE.findall(_sp_nc_before))} `?? value ||` operator-precedence expression(s).")
+                        _sp_tsx, _sp_str_count = _fix_unterminated_strings(_sp_tsx)
+                        if _sp_str_count:
+                            merged_blob["index.tsx"] = _sp_tsx
+                            narrate("Dr. Mira Kessler", f"SECOND-PASS REPAIR: Closed {_sp_str_count} unterminated string(s) — full file scan.")
+                        # Targeted line-number repair: trust the build gate's reported line number.
+                        _sp_retry_syn_errs = [
+                            e for e in re.split(r';\s*', _retry_details)
+                            if 'unterminated string literal at line' in e
+                        ]
+                        for _sp_se in _sp_retry_syn_errs:
+                            _sp_se_m = re.search(r'unterminated string literal at line (\d+)', _sp_se)
+                            if not _sp_se_m:
+                                continue
+                            _sp_ln_idx = int(_sp_se_m.group(1)) - 1
+                            _sp_tgt_lines = _sp_tsx.splitlines(keepends=True)
+                            if 0 <= _sp_ln_idx < len(_sp_tgt_lines):
+                                _sp_tgt_raw = _sp_tgt_lines[_sp_ln_idx].rstrip('\r\n')
+                                _sp_sq2 = False; _sp_dq2 = False; _sp_ci2 = 0
+                                while _sp_ci2 < len(_sp_tgt_raw):
+                                    _sp_c2 = _sp_tgt_raw[_sp_ci2]
+                                    if _sp_c2 == '\\' and (_sp_sq2 or _sp_dq2):
+                                        _sp_ci2 += 2; continue
+                                    if _sp_c2 == '`':
+                                        _sp_ci2 += 1; continue
+                                    if not _sp_dq2 and _sp_c2 == "'":
+                                        _sp_sq2 = not _sp_sq2
+                                    elif not _sp_sq2 and _sp_c2 == '"':
+                                        _sp_dq2 = not _sp_dq2
+                                    _sp_ci2 += 1
+                                _sp_unc2 = "'" if _sp_sq2 else '"' if _sp_dq2 else None
+                                if _sp_unc2:
+                                    _sp_tgt_lines[_sp_ln_idx] = _sp_tgt_raw + _sp_unc2 + '\n'
+                                    _sp_tsx = ''.join(_sp_tgt_lines)
+                                    merged_blob["index.tsx"] = _sp_tsx
+                                    narrate("Dr. Mira Kessler", f"SECOND-PASS REPAIR: Targeted force-close of unterminated {_sp_unc2!r} on line {_sp_ln_idx + 1}.")
+
                         # Re-run Leaflet map height fix on second pass.
                         _sp_lh_refs = list(dict.fromkeys(re.findall(r'<div\b[^>]*\bref=\{(\w+)\}', _sp_tsx)))
                         _sp_lh_changed = False
@@ -6367,6 +7424,167 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                     "Dr. Mira Kessler",
                                     f"SECOND-PASS REPAIR: Injected onKeyDown Enter handler on search input(s) (handler: {_sp_kd_fn}).",
                                 )
+
+                        # Second-pass: re-run app.py boilerplate injection in case a
+                        # previous LLM patch accidentally dropped the register function.
+                        _sp_app = merged_blob.get("app.py", "")
+                        _sp_app_changed = False
+                        if not re.search(r'^\s*def\s+register\s*\(\s*\)\s*:', _sp_app, re.MULTILINE):
+                            merged_blob["app.py"] = _sp_app.rstrip() + "\n\ndef register():\n    return router\n"
+                            _sp_app_changed = True
+                            narrate("Isaac Moreno", "SECOND-PASS REPAIR: Re-injected missing `def register(): return router` into app.py.")
+                        if not re.search(r'^\s*router\s*=\s*APIRouter\s*\(\)', _sp_app, re.MULTILINE):
+                            merged_blob["app.py"] = "from fastapi import APIRouter\nrouter = APIRouter()\n\n" + merged_blob["app.py"]
+                            _sp_app_changed = True
+                            narrate("Isaac Moreno", "SECOND-PASS REPAIR: Re-injected missing `router = APIRouter()` into app.py.")
+                        if "import os" not in _sp_app:
+                            merged_blob["app.py"] = "import os\n" + merged_blob["app.py"]
+                            _sp_app_changed = True
+                            narrate("Isaac Moreno", "SECOND-PASS REPAIR: Re-injected missing `import os` into app.py.")
+                        _sp_ihtml = merged_blob.get("index.html", "")
+                        if _sp_ihtml and "/index.html" not in _sp_ihtml:
+                            _sp_dash = '<a href="/index.html" style="position:fixed;bottom:8px;right:8px;z-index:9999;background:#1a1a2e;color:#e2e8f0;padding:6px 12px;border-radius:6px;font-size:12px;text-decoration:none">&#8592; Dashboard</a>'
+                            merged_blob["index.html"] = _sp_ihtml.replace("</body>", f"{_sp_dash}</body>") if "</body>" in _sp_ihtml else _sp_ihtml + f"\n{_sp_dash}"
+                            narrate("Naomi Kade", "SECOND-PASS REPAIR: Re-injected missing return-to-dashboard link into index.html.")
+                        _sp_rdx = merged_blob.get("index.tsx", "")
+                        if "import('react-dom" in _sp_rdx:
+                            _sp_rdx = re.sub(r"import\s*\(\s*['\"]react-dom/client['\"]\s*\)", "import ReactDOM from 'react-dom/client'", _sp_rdx)
+                            _sp_rdx = re.sub(r"import\s*\(\s*['\"]react-dom['\"]\s*\)", "import ReactDOM from 'react-dom/client'", _sp_rdx)
+                            merged_blob["index.tsx"] = _sp_rdx
+                            narrate("Juniper Ryle", "SECOND-PASS REPAIR: Replaced dynamic ReactDOM import with static import.")
+
+                        # Second-pass: AUTOLOAD MANDATE deterministic useEffect injection.
+                        # Fires when RULES_COMPLIANCE "AUTOLOAD MANDATE" errors survive all LLM
+                        # repair passes. The LLM repair may return 0 edits for large TSX files
+                        # because the relevant component is beyond the numbered-content window or
+                        # the thinking budget is exhausted. This deterministic fallback:
+                        #   1. Finds the first fetch function that references model-comparison data.
+                        #   2. Checks if it is already called from a useEffect anywhere in the file.
+                        #   3. If not, injects `useEffect(() => { fn(); }, [lat, lon])` immediately
+                        #      before the component's first `return (` that comes after the function.
+                        # No module names are hardcoded — pattern matching only.
+                        if _retry_details and "AUTOLOAD MANDATE" in _retry_details:
+                            _sp_tsx_ue = merged_blob.get("index.tsx", "")
+                            _ue_fn_m = re.search(
+                                r'\b(fetch[A-Za-z]{0,30}[Mm]odels?|load[A-Za-z]{0,20}[Mm]odels?'
+                                r'|get[A-Za-z]{0,20}[Mm]odels?|fetch[A-Za-z]{0,30}[Cc]omparison'
+                                r'|fetch[A-Za-z]{0,30}[Ee]nsemble|fetch[A-Za-z]{0,30}[Dd]ivergence)\b',
+                                _sp_tsx_ue
+                            )
+                            if _ue_fn_m:
+                                _ue_fn_name = _ue_fn_m.group(1)
+                                _ue_already_m = re.search(
+                                    r'useEffect[^;]{0,1500}?' + re.escape(_ue_fn_name),
+                                    _sp_tsx_ue, re.DOTALL
+                                )
+                                if not _ue_already_m:
+                                    _ue_lat_m = re.search(r'\bconst\s+\[?\s*(lat)\b', _sp_tsx_ue) or re.search(r'\bconst\s+(latitude)\b', _sp_tsx_ue)
+                                    _ue_lon_m = re.search(r'\bconst\s+\[?\s*(lon|lng)\b', _sp_tsx_ue) or re.search(r'\bconst\s+(longitude)\b', _sp_tsx_ue)
+                                    _ue_lat_v = _ue_lat_m.group(1) if _ue_lat_m else "lat"
+                                    _ue_lon_v = _ue_lon_m.group(1) if _ue_lon_m else "lon"
+                                    _ue_code = f"\n  useEffect(() => {{ {_ue_fn_name}(); }}, [{_ue_lat_v}, {_ue_lon_v}]);\n"
+                                    _ue_decl_m = re.search(
+                                        r'(?:const|let|var|function)\s+' + re.escape(_ue_fn_name) + r'\b',
+                                        _sp_tsx_ue
+                                    )
+                                    if _ue_decl_m:
+                                        _ue_search_start = _ue_decl_m.end()
+                                        _ue_ret_m = re.search(r'\n(\s*)return\s*[\(\n]', _sp_tsx_ue[_ue_search_start:])
+                                        if _ue_ret_m:
+                                            _ue_insert_pos = _ue_search_start + _ue_ret_m.start()
+                                            _sp_tsx_ue = _sp_tsx_ue[:_ue_insert_pos] + _ue_code + _sp_tsx_ue[_ue_insert_pos:]
+                                            # Ensure useEffect is in the React import
+                                            if 'useEffect' not in _sp_tsx_ue[:600]:
+                                                _sp_tsx_ue = re.sub(
+                                                    r"(import\s+(?:React,?\s*)?\{([^}]*)\}\s*from\s*['\"]react['\"])",
+                                                    lambda m: m.group(0).replace(m.group(2), m.group(2).rstrip(', ') + ', useEffect'),
+                                                    _sp_tsx_ue, count=1
+                                                )
+                                            merged_blob["index.tsx"] = _sp_tsx_ue
+                                            narrate("Juniper Ryle", f"SECOND-PASS REPAIR: Injected missing `useEffect(() => {{ {_ue_fn_name}(); }}, [{_ue_lat_v}, {_ue_lon_v}])` — satisfies AUTOLOAD MANDATE.")
+
+                        # Second-pass: PATTERN STUDIO PERSONA ITERATION MANDATE.
+                        # Re-runs the TIER B Pattern Studio fix if the error survived
+                        # the first pass and the LLM patch. Generic — persona names
+                        # come from extracted_personas, never hardcoded.
+                        if "PATTERN STUDIO PERSONA ITERATION MANDATE" in _retry_details:
+                            _sp2_tsx = merged_blob.get("index.tsx", "")
+                            _sp2_guard = re.search(
+                                r'\bdomainPersonas\b|\bpersonaNodes\s*=\s*\[|\bpersonas\.map\b'
+                                r'|\bpersonaList\s*\.map\b|\bnodes\.map\b|\ballPersonas\s*\.map\b',
+                                _sp2_tsx, re.IGNORECASE
+                            )
+                            if not _sp2_guard and extracted_personas:
+                                _sp2_entries = [
+                                    '{name: ' + json.dumps(p.get('name', '')) + ', role: ' + json.dumps(p.get('role', '')) + '}'
+                                    for p in extracted_personas
+                                ]
+                                _sp2_decl = 'const domainPersonas = [' + ', '.join(_sp2_entries) + '];'
+                                _sp2_trig = next(
+                                    (t for t in ['SYNTHESIS CORE', 'Pattern Studio', 'PatternStudio', 'Convergence Topology']
+                                     if t in _sp2_tsx), None
+                                )
+                                if _sp2_trig:
+                                    _sp2_anchor = _sp2_tsx.find(_sp2_trig)
+                                    _sp2_fn_m = None
+                                    for _sp2_fn_pat in [
+                                        r'const\s+[A-Z]\w*\s*(?::\s*React\.FC[^=]*)?\s*=\s*(?:async\s*)?\(\s*\)\s*=>\s*\{',
+                                        r'function\s+[A-Z]\w*\s*\([^)]*\)\s*\{',
+                                    ]:
+                                        _sp2_cands = list(re.finditer(_sp2_fn_pat, _sp2_tsx[:_sp2_anchor]))
+                                        if _sp2_cands:
+                                            _sp2_fn_m = _sp2_cands[-1]
+                                            break
+                                    if _sp2_fn_m:
+                                        _sp2_fb = _sp2_fn_m.end()
+                                        _sp2_tsx = _sp2_tsx[:_sp2_fb] + '\n  ' + _sp2_decl + '\n' + _sp2_tsx[_sp2_fb:]
+                                        _sp2_anchor += len('\n  ' + _sp2_decl + '\n')
+                                    else:
+                                        _sp2_tsx = _sp2_decl + '\n' + _sp2_tsx
+                                        _sp2_anchor += len(_sp2_decl) + 1
+                                    _sp2_win = _sp2_tsx[_sp2_anchor: _sp2_anchor + 12000]
+                                    _sp2_svg_m = re.search(r'</svg>', _sp2_win)
+                                    _sp2_is_svg = _sp2_svg_m is not None
+                                    _sp2_close_rel = _sp2_svg_m.start() if _sp2_svg_m else -1
+                                    if _sp2_close_rel < 0:
+                                        _sp2_div_m = re.search(r'</div>', _sp2_win)
+                                        _sp2_close_rel = _sp2_div_m.start() if _sp2_div_m else -1
+                                    if _sp2_close_rel >= 0:
+                                        _sp2_abs = _sp2_anchor + _sp2_close_rel
+                                        if _sp2_is_svg:
+                                            _sp2_nodes = (
+                                                '\n{domainPersonas.map((persona, i) => {'
+                                                ' const angle = (i / domainPersonas.length) * 2 * Math.PI;'
+                                                ' const r = 160;'
+                                                ' const nx = 250 + Math.cos(angle - Math.PI / 2) * r;'
+                                                ' const ny = 250 + Math.sin(angle - Math.PI / 2) * r;'
+                                                ' return (<g key={persona.name} transform={`translate(${nx}, ${ny})`}'
+                                                ' style={{cursor:"pointer"}}>'
+                                                '<circle r={22} fill="#1e293b" stroke="#3b82f6" strokeWidth={2}/>'
+                                                '<text textAnchor="middle" dy={4} fill="#94a3b8" fontSize={9}>'
+                                                '{persona.name.split(" ").slice(-1)[0]}'
+                                                '</text></g>);})}' + '\n'
+                                            )
+                                        else:
+                                            _sp2_nodes = (
+                                                '\n{domainPersonas.map((persona, i) => {'
+                                                ' const angle = (i / domainPersonas.length) * 2 * Math.PI;'
+                                                ' const r = 160;'
+                                                ' return (<div key={persona.name}'
+                                                ' style={{position:"absolute",'
+                                                'left:`calc(50% + ${Math.cos(angle - Math.PI/2) * r}px)`,'
+                                                'top:`calc(50% + ${Math.sin(angle - Math.PI/2) * r}px)`,'
+                                                'transform:"translate(-50%,-50%)",background:"#1e293b",'
+                                                'border:"2px solid #3b82f6",borderRadius:"50%",'
+                                                'width:44,height:44,display:"flex",alignItems:"center",'
+                                                'justifyContent:"center",cursor:"pointer"}}>'
+                                                '<span style={{fontSize:8,color:"#94a3b8",textAlign:"center"}}>'
+                                                '{persona.name.split(" ").slice(-1)[0]}'
+                                                '</span></div>);})}' + '\n'
+                                            )
+                                        _sp2_tsx = _sp2_tsx[:_sp2_abs] + _sp2_nodes + _sp2_tsx[_sp2_abs:]
+                                        merged_blob["index.tsx"] = _sp2_tsx
+                                        narrate("Juniper Ryle", f"SECOND-PASS REPAIR: Injected domainPersonas.map() with {len(_sp2_entries)} persona node(s) into Pattern Studio topology.")
 
                         _lui_res = build_gate.process_build(module_name, json.dumps(merged_blob), task_prompt=prompt)
 

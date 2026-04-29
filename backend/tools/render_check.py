@@ -442,6 +442,8 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
         "functional": {},
         "functional_failures": [],
         "api_404s": [],
+        "api_500s": [],
+        "api_422s": [],
     }
     url = f"http://127.0.0.1:{port}/static/built/modules/{module_name}/index.html"
     narrate("Dr. Mira Kessler", f"Render check: loading {url} in headless browser...")
@@ -462,6 +464,8 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
 
         console_errors = []
         api_404s = []
+        api_500s = []
+        api_422s = []
 
         def _on_console(msg):
             if msg.type in ("error", "warning"):
@@ -471,10 +475,17 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
             console_errors.append(f"[uncaught] {error.message if hasattr(error, 'message') else str(error)}")
 
         def _on_response(response):
-            if response.status == 404 and '/api/' in response.url:
+            if '/api/' in response.url:
                 path = response.url.split('/api/', 1)[-1] if '/api/' in response.url else response.url
-                if path not in api_404s:
-                    api_404s.append(path)
+                if response.status == 404:
+                    if path not in api_404s:
+                        api_404s.append(path)
+                elif response.status == 500:
+                    if path not in api_500s:
+                        api_500s.append(path)
+                elif response.status == 422:
+                    if path not in api_422s:
+                        api_422s.append(path)
 
         page.on("console", _on_console)
         page.on("pageerror", _on_page_error)
@@ -652,6 +663,43 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
                 f"frontend fetches these but they are not registered in app.py: "
                 + ", ".join(f"/{p}" for p in api_404s[:8])
                 + ". Add the missing @router.get/post entries to app.py."
+            )
+
+        # API 500 DETECTION: report any /api/ routes that returned 500 during this session.
+        # 500 errors indicate a runtime exception in the backend route handler — e.g. a
+        # NameError because a module-level cache dict was referenced inside the function
+        # without being declared at module scope, or a missing import, or a failed assertion.
+        # These must be treated as build failures because every page load will hit these errors
+        # and the affected data panels will always be empty. Unlike 404s (missing route), 500s
+        # mean the route exists but crashes on every call.
+        result["api_500s"] = api_500s
+        if api_500s:
+            functional_failures.append(
+                f"API 500: {len(api_500s)} backend route(s) returned 500 (server crash) — "
+                f"these routes exist in app.py but throw an exception on every request: "
+                + ", ".join(f"/{p}" for p in api_500s[:8])
+                + ". Fix the crash in app.py (common causes: NameError from undeclared "
+                "module-level variable, missing import, uninitialized cache dict). "
+                "Declare any module-level dict (e.g. `_cache = {'result': None, 'timestamp': 0}`) "
+                "BEFORE the first @router decorator."
+            )
+
+        # API 422 DETECTION: report any /api/ routes that returned 422 (Unprocessable Entity).
+        # 422 means the route exists and doesn't crash, but the request was rejected because
+        # required query parameters (lat, lon, etc.) were missing or had wrong types in the
+        # frontend fetch call. The route returns 200 when called correctly, so this is purely
+        # a frontend parameter-passing bug. Every affected endpoint returns empty/zero data
+        # because the frontend URL is missing required params like ?lat={lat}&lon={lon}.
+        result["api_422s"] = api_422s
+        if api_422s:
+            functional_failures.append(
+                f"API 422: {len(api_422s)} backend route(s) returned 422 (Unprocessable Entity) — "
+                f"the frontend fetch URL for these routes is missing required query parameters "
+                f"(most commonly lat and lon): "
+                + ", ".join(f"/{p}" for p in api_422s[:8])
+                + ". Fix in index.tsx: ensure every fetch call to these endpoints includes ALL "
+                "required query params, e.g. `fetch('/api/.../route?lat=${lat}&lon=${lon}')`. "
+                "Check the backend @router.get signature for the required parameter names."
             )
 
         result["functional_failures"] = functional_failures

@@ -4,7 +4,7 @@
     "modules": {
         "weather_and_planetary_intelligence": {
             "name": "weather_and_planetary_intelligence",
-            "description": "Premium multi-page Weather and Planetary Intelligence System featuring advanced weather tracking, global real-time mapping, oceanic intelligence, seismic monitoring, space weather, astronomy, hazard center, and AI lab.",
+            "description": "High-fidelity, multi-domain planetary intelligence platform integrating multi-source meteorological, seismic, oceanic, and space weather telemetry with a 7-persona AI synthesis pipeline.",
             "path": "backend/modules/weather_and_planetary_intelligence",
             "entrypoint": "app.py",
             "ui_link": "index.html",

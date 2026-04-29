@@ -261,13 +261,29 @@ class RepairOrchestrator:
                             elif _re.search(r'\};[ \t]*\};', tsx_content):
                                 broken_files.append("index.tsx (same-line cascading close-braces '};}; ')")
                             else:
+                                _det_qt_carry = False
+                                _det_bc = False
                                 for line_num, line in enumerate(tsx_content.splitlines(), 1):
                                     in_single = False
                                     in_double = False
-                                    in_template = False
+                                    in_template = _det_qt_carry
                                     i = 0
                                     while i < len(line):
                                         ch = line[i]
+                                        if _det_bc:
+                                            if line[i:i + 2] == '*/':
+                                                _det_bc = False
+                                                i += 2
+                                            else:
+                                                i += 1
+                                            continue
+                                        if not (in_single or in_double or in_template):
+                                            if line[i:i + 2] == '//':
+                                                break
+                                            if line[i:i + 2] == '/*':
+                                                _det_bc = True
+                                                i += 2
+                                                continue
                                         if ch == '\\' and (in_single or in_double):
                                             i += 2
                                             continue
@@ -279,6 +295,7 @@ class RepairOrchestrator:
                                             elif ch == '"' and not in_single:
                                                 in_double = not in_double
                                         i += 1
+                                    _det_qt_carry = in_template
                                     if in_single or in_double:
                                         broken_files.append(f"index.tsx (unterminated string literal at line {line_num})")
                                         break
@@ -292,11 +309,24 @@ class RepairOrchestrator:
                         _tsx_text = tsx_path.read_text(encoding="utf-8", errors="ignore")
                         _tsx_ls = _tsx_text.splitlines(keepends=True)
                         _orch_fixed_count = 0
+                        _orch_qt_carry = False
+                        _orch_bc = False
                         for _orch_i, _orch_line in enumerate(_tsx_ls):
-                            _orch_qs = False; _orch_qd = False; _orch_qt = False
+                            _orch_qs = False; _orch_qd = False; _orch_qt = _orch_qt_carry
                             _orch_lqcol = -1; _orch_lqch = None; _orch_ci = 0
                             while _orch_ci < len(_orch_line):
                                 _orch_ch = _orch_line[_orch_ci]
+                                if _orch_bc:
+                                    if _orch_line[_orch_ci:_orch_ci + 2] == '*/':
+                                        _orch_bc = False; _orch_ci += 2
+                                    else:
+                                        _orch_ci += 1
+                                    continue
+                                if not (_orch_qs or _orch_qd or _orch_qt):
+                                    if _orch_line[_orch_ci:_orch_ci + 2] == '//':
+                                        break
+                                    if _orch_line[_orch_ci:_orch_ci + 2] == '/*':
+                                        _orch_bc = True; _orch_ci += 2; continue
                                 if _orch_ch == '\\' and (_orch_qs or _orch_qd):
                                     _orch_ci += 2; continue
                                 if _orch_ch == '`':
@@ -309,10 +339,24 @@ class RepairOrchestrator:
                                         _orch_qd = not _orch_qd
                                         if _orch_qd: _orch_lqcol = _orch_ci; _orch_lqch = '"'
                                 _orch_ci += 1
+                            _orch_qt_carry = _orch_qt
                             if (_orch_qs or _orch_qd) and _orch_lqch and _orch_lqcol >= 0:
+                                _orch_jsx_text_apos = False
+                                if _orch_lqch == "'":
+                                    for _ojxt_i in range(_orch_lqcol - 1, -1, -1):
+                                        if _orch_line[_ojxt_i] == '>':
+                                            _orch_jsx_text_apos = True; break
+                                        if _orch_line[_ojxt_i] in ('{', '<', '(', '"', '='):
+                                            break
+                                if _orch_jsx_text_apos:
+                                    continue
                                 _orch_stripped = _orch_line.rstrip('\r\n')
                                 _orch_has_split = bool(_re.search(r'\.split\(\s*$', _orch_stripped[:_orch_lqcol]))
-                                if _orch_has_split:
+                                before_q = _orch_stripped[:_orch_lqcol]
+                                _in_jsx_attr = before_q.rfind('<') > before_q.rfind('>')
+                                if _in_jsx_attr:
+                                    _tsx_ls[_orch_i] = _orch_stripped + _orch_lqch + '/>\n'
+                                elif _orch_has_split:
                                     _tsx_ls[_orch_i] = _orch_stripped + _orch_lqch + ')\n'
                                 else:
                                     _tsx_ls[_orch_i] = _orch_stripped + _orch_lqch + '\n'

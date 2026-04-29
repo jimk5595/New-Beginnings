@@ -31,6 +31,73 @@ class BuildGate:
         else:
             self.project_root = Path(project_root)
 
+    def _check_undeclared_module_dicts(self, app_py: str, errors: list) -> None:
+        """
+        AST-based check: find any name X where X[key] is used inside a router handler
+        function body but X is never assigned at module scope. This catches the common
+        NameError pattern where a caching dict is referenced in a function without a
+        corresponding module-level initialization, causing HTTP 500 on every request.
+        Only fires for names matching a 'cache/data/state/store' naming pattern since
+        those are the overwhelmingly common source of this bug.
+        """
+        if not app_py or not app_py.strip():
+            return
+        try:
+            tree = ast.parse(app_py)
+        except SyntaxError:
+            return
+
+        _cache_name_re = re.compile(
+            r'^_\w*(?:cache|data|state|store|buffer|queue|result|pool|registry|lock)\w*$',
+            re.IGNORECASE
+        )
+
+        module_scope_names = set()
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        module_scope_names.add(target.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                module_scope_names.add(node.target.id)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_scope_names.add(alias.asname or alias.name.split('.')[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    module_scope_names.add(alias.asname or alias.name)
+
+        _reported = set()
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            local_names = set()
+            for child in ast.walk(node):
+                if isinstance(child, ast.Assign):
+                    for t in child.targets:
+                        if isinstance(t, ast.Name):
+                            local_names.add(t.id)
+                elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+                    local_names.add(child.target.id)
+                elif isinstance(child, ast.arg):
+                    local_names.add(child.arg)
+            for child in ast.walk(node):
+                if (isinstance(child, ast.Subscript)
+                        and isinstance(child.value, ast.Name)):
+                    name = child.value.id
+                    if (name not in module_scope_names
+                            and name not in local_names
+                            and name not in _reported
+                            and _cache_name_re.match(name)):
+                        _reported.add(name)
+                        errors.append(
+                            f"DATA_ERROR: [app.py] UNDECLARED MODULE-LEVEL DICT '{name}' — "
+                            f"used as `{name}[...]` inside function `{node.name}()` but never "
+                            f"assigned at module scope. Every request to this route will throw "
+                            f"NameError 500. Fix: add `{name} = {{\"result\": None, \"timestamp\": 0, "
+                            f"\"running\": False}}` at module scope BEFORE the first @router decorator."
+                        )
+
     def _run_validation_rules(self, app_py: str, tsx_raw: str, errors: list) -> None:
         """
         Load resources/validation_rules.json and apply each check generically.
@@ -58,8 +125,11 @@ class BuildGate:
             _msg = _c.get("error_message", "")
             _fw = _c.get("fire_when", "guard_absent")
 
+            _rule_target = _c.get("target", "index.tsx")
+            _target_tag = " [app.py]" if _rule_target == "app.py" else ""
+
             if _ctype == "body_guard":
-                _src = app_py if _c.get("target") == "app.py" else tsx_raw
+                _src = app_py if _rule_target == "app.py" else tsx_raw
                 _anchor = _c.get("anchor", "")
                 _idx = _src.find(_anchor)
                 if _idx < 0:
@@ -71,22 +141,26 @@ class BuildGate:
                 _fail_found = bool(re.search(_fp, _body, _flags)) if _fp else False
                 if _fw == "guard_absent_and_fail_present":
                     if not _guard_found and _fail_found:
-                        errors.append(f"{_cat}: {_msg}")
+                        errors.append(f"{_cat}:{_target_tag} {_msg}")
                 elif _fw == "guard_absent":
                     if not _guard_found:
-                        errors.append(f"{_cat}: {_msg}")
+                        errors.append(f"{_cat}:{_target_tag} {_msg}")
                 elif _fw == "guard_present":
                     if _guard_found:
-                        errors.append(f"{_cat}: {_msg}")
+                        errors.append(f"{_cat}:{_target_tag} {_msg}")
 
             elif _ctype == "presence_guard":
-                _src = app_py if _c.get("target") == "app.py" else tsx_raw
+                _src = app_py if _rule_target == "app.py" else tsx_raw
                 if not any(t in _src for t in _c.get("trigger_any", [])):
                     continue
                 _gp = _c.get("guard_pattern")
                 _guard_found = bool(re.search(_gp, _src, _flags)) if _gp else True
-                if not _guard_found:
-                    errors.append(f"{_cat}: {_msg}")
+                if _fw == "guard_present":
+                    if _guard_found:
+                        errors.append(f"{_cat}:{_target_tag} {_msg}")
+                else:
+                    if not _guard_found:
+                        errors.append(f"{_cat}:{_target_tag} {_msg}")
 
             elif _ctype == "tsx_autoload":
                 _route = _c.get("route_substr", "")
@@ -102,7 +176,7 @@ class BuildGate:
                     and any(bool(re.search(p, tsx_raw, _flags)) for p in _handler_pats)
                 )
                 if _only_in_handler:
-                    errors.append(f"{_cat}: {_msg}")
+                    errors.append(f"{_cat}:{_target_tag} {_msg}")
 
     def validate_blob(self, module_name: str, blob: Dict[str, str], task_prompt: str = None) -> Tuple[bool, List[str]]:
         """
@@ -170,6 +244,12 @@ class BuildGate:
         except SyntaxError as _se:
             _bad_line = (_se.text or "").strip()
             errors.append(f"SYNTAX_ERROR: app.py has invalid Python syntax at line {_se.lineno}: {_se.msg} — '{_bad_line}'")
+
+        # AST check: detect module-level dict variables used inside @router handler functions
+        # but never declared at module scope. The most common form is a caching dict like
+        # `_precursor_cache["result"]` inside `async def precursor_analysis()` where the
+        # dict is never initialized at module scope — causing NameError 500 on every request.
+        self._check_undeclared_module_dicts(app_py, errors)
 
         # Tile proxy check: if frontend uses /api/.../tile/ URLs, backend MUST define the route.
         import re as _re_proxy
@@ -1170,8 +1250,10 @@ class BuildGate:
             # dark_nolabels or light_nolabels at opacity > 0.3 on top of SST
             # tiles is a full-world basemap that covers both land AND ocean,
             # completely hiding the SST color gradient.
+            # Catches all opacity variants > 0.3: 0.4-0.9x, 1, 1.0, and JSX
+            # attribute form opacity={N} as well as object literal opacity: N.
             _sst_mask_bad = _re_proxy.search(
-                r"""(?:dark_nolabels|light_nolabels)[^'"]*['"][^}]*opacity\s*:\s*0\.[6-9]\d*""",
+                r"""(?:dark_nolabels|light_nolabels)[^'"]*['"][^}]*opacity\s*[=:]\s*\{?(?:0\.[4-9]\d*|1(?:\.0?)?)\}?""",
                 _tsx_raw
             )
             if _sst_mask_bad:

@@ -337,7 +337,14 @@ def inject_chat_bubble(html_path: Path, personas: list):
         if "__nb_chat_root__" in content:
             return
         bubble = build_chat_bubble_html(personas)
-        content = content.replace("</body>", bubble + "\n</body>")
+        if "</body>" in content:
+            content = content.replace("</body>", bubble + "\n</body>")
+        elif "</html>" in content:
+            content = content.replace("</html>", bubble + "\n</html>")
+            print(f"    WARNING: {html_path.name} has no </body> tag — injected chat bubble before </html> instead.")
+        else:
+            content = content + "\n" + bubble
+            print(f"    WARNING: {html_path.name} has no </body> or </html> tag — appended chat bubble to end of file.")
         html_path.write_text(content, encoding="utf-8", errors="replace")
     except Exception as e:
         print(f"    WARNING: Could not inject chat bubble into {html_path}: {e}")
@@ -467,6 +474,21 @@ def build_modules(target_module: str = None):
                         continue
                     else:
                         print(f"    Bundle written: {out_file}")
+                        # Rewrite script src from index.tsx/index.ts -> index.js in the built HTML.
+                        # The source index.html always references the TS source file as the entry
+                        # point, but the browser must load the compiled index.js bundle.  Without
+                        # this rewrite the script tag 404s silently and the app renders blank.
+                        _html_rewrite_path = target_dir / "index.html"
+                        if _html_rewrite_path.exists():
+                            _html_rw = _html_rewrite_path.read_text(encoding="utf-8", errors="replace")
+                            _html_rw_orig = _html_rw
+                            _html_rw = _html_rw.replace('src="index.tsx"', 'src="index.js"')
+                            _html_rw = _html_rw.replace("src='index.tsx'", "src='index.js'")
+                            _html_rw = _html_rw.replace('src="index.ts"', 'src="index.js"')
+                            _html_rw = _html_rw.replace("src='index.ts'", "src='index.js'")
+                            if _html_rw != _html_rw_orig:
+                                _html_rewrite_path.write_text(_html_rw, encoding="utf-8", errors="replace")
+                                print(f"    Rewrote script src index.tsx -> index.js in index.html")
                         css_out = target_dir / "index.css"
                         if css_out.exists():
                             html_out_path = target_dir / "index.html"

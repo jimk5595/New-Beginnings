@@ -5,7 +5,7 @@
     "body_guard": "Find 'anchor' string in 'target', scan 'body_chars' chars after it. Fire when guard_pattern absent (and optionally fail_pattern present).",
     "presence_guard": "Fire when any of 'trigger_any' strings appear in 'target' AND guard_pattern is absent from full target.",
     "tsx_autoload": "Fire when route_substr appears in index.tsx AND is NOT referenced inside a useEffect (only inside click handlers).",
-    "fire_when": "guard_absent | guard_absent_and_fail_present"
+    "fire_when": "guard_absent | guard_absent_and_fail_present | guard_present"
   },
   "checks": [
     {
@@ -160,7 +160,7 @@
       "check_type": "presence_guard",
       "target": "index.tsx",
       "trigger_any": ["What-If", "WhatIf", "whatif", "Scenario Builder", "whatIfOffset", "whatif_offset", "temperature forcing"],
-      "guard_pattern": "useEffect[\\s\\S]{0,600}?(?:ailab/models|comparison_points|whatif|gfs_temp|ecmwf_temp)",
+      "guard_pattern": "useEffect[\\s\\S]{0,800}?(?:fetch[A-Za-z]*[Mm]odels?|load[A-Za-z]*[Mm]odels?|get[A-Za-z]*[Mm]odels?|ailab/models|comparison_points|whatif|gfs_temp|ecmwf_temp|[Mm]odel[Cc]omparison|ensemble[Dd]ata|divergence)",
       "fire_when": "guard_absent",
       "flags": ["IGNORECASE", "DOTALL"],
       "error_category": "RULES_COMPLIANCE",
@@ -187,6 +187,84 @@
       "flags": ["IGNORECASE"],
       "error_category": "RULES_COMPLIANCE",
       "error_message": "RADAR FORECAST FRAMES MANDATE violated — the frontend radar timeline references past frames but does not reference `nowcast_frames` or `isForecast`. Even if the backend correctly returns `nowcast_frames`, the frontend will show 'No forecast data' if it only reads `past_frames` from the response. Fix: merge both arrays: `const allFrames = [...(data.past_frames||[]).map(f=>({...f,isForecast:false})), ...(data.nowcast_frames||[]).map(f=>({...f,isForecast:true}))]; setFrames(allFrames);`. Label forecast frames with 'Forecast' prefix on the timestamp. The timeline slider must cover all frames. Per RADAR FORECAST FRAMES MANDATE."
+    },
+    {
+      "id": "RADAR_FRAME_VARIABLE_SCOPE",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["RainViewer", "rainviewer", "radarFrames", "allFrames", "radar_frames", "past.*radar", "radar.*past"],
+      "guard_pattern": "useRef.*[Ff]rame|[Ff]rame.*useRef|useRef.*[Rr]adar|[Rr]adar.*useRef|framesRef|radarRef|animRef",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE", "DOTALL"],
+      "error_category": "RUNTIME_ERROR",
+      "error_message": "RADAR FRAME VARIABLE SCOPE MANDATE violated — RainViewer radar frame data is stored in a plain `let` variable or closure-scoped variable instead of a `useRef`. Variables like `allFrames`, `radarFrames`, or `frames` that are set inside a fetch callback (or useEffect) and then READ by animation timers or event handlers MUST use `useRef` to persist across renders and be accessible outside the declaring scope. A plain `let allFrames = []` declared inside a useEffect IS NOT ACCESSIBLE in onClick handlers or setInterval callbacks defined elsewhere — this causes `allFrames is not defined` ReferenceError crashes when the user clicks Play. Fix: replace `let allFrames = []` with `const allFramesRef = useRef<any[]>([])`, assign via `allFramesRef.current = frames` inside the fetch, and read via `allFramesRef.current[index]` in the animation handler. Per RADAR FRAME VARIABLE SCOPE MANDATE."
+    },
+    {
+      "id": "PATTERN_STUDIO_ALL_PERSONAS",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["Pattern Studio", "PatternStudio", "Convergence Topology", "SYNTHESIS CORE", "SynthesisCore", "satellite.*node", "domain.*node"],
+      "guard_pattern": "personas\\.map|personas\\.forEach|personaList.*map|allPersonas.*map|domainPersonas.*map|nodes\\.map|personaNodes\\.map|PERSONAS\\.map|personaArray",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE", "DOTALL"],
+      "error_category": "UI_ERROR",
+      "error_message": "PATTERN STUDIO PERSONA ITERATION MANDATE violated — the Pattern Studio topology is NOT mapping over all domain personas to render satellite nodes. When only 1 node appears it means the code hardcodes a single node or references a single persona by name instead of iterating over the full personas array. Fix: define a `const domainPersonas = [{ name: '...', role: '...' }, ...]` array containing ALL module personas and render satellite nodes with `domainPersonas.map((persona, i) => ...)`, positioning each node radially around the SYNTHESIS CORE using `Math.cos` / `Math.sin` with evenly spaced angles (`(i / domainPersonas.length) * 2 * Math.PI`). Every persona must appear as a satellite node. Per PATTERN STUDIO PERSONA ITERATION MANDATE."
+    },
+    {
+      "id": "PATTERN_STUDIO_CANVAS_OVERFLOW",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["Pattern Studio", "PatternStudio", "convergence_topology", "domain_reports", "Convergence Core"],
+      "guard_pattern": "overflow.*visible|minHeight.*[\"']?[3-9]\\d{2}|height.*[\"']?[4-9]\\d{2}|h-\\[[4-9]\\d{2}|paddingBottom|pb-\\d{2,}",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "UI_ERROR",
+      "error_message": "PATTERN STUDIO CANVAS OVERFLOW MANDATE violated — the Pattern Studio topology canvas does not set a minimum height tall enough to display all persona nodes without clipping. With 7 nodes arranged in a radial layout, the bottom node is cut off when the canvas is less than 450px tall. Fix: set the topology container to `style={{minHeight:'500px', overflow:'visible'}}` or `className='min-h-[500px] overflow-visible'` so all nodes are fully visible without scrolling. Per PATTERN STUDIO CANVAS OVERFLOW MANDATE."
+    },
+    {
+      "id": "AILAB_DEBATE_ENDPOINT",
+      "check_type": "body_guard",
+      "target": "app.py",
+      "anchor": "/ailab/",
+      "body_chars": 8000,
+      "guard_pattern": "debate|cross.?domain.*persona|persona.*synthesis|precursor.*synthesis|llm.*pipeline",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE"],
+      "error_category": "DATA_ERROR",
+      "error_message": "AI LAB DEBATE ENDPOINT MANDATE violated — the /ailab/ routes do not include a debate/synthesis endpoint. The Cross-Domain Persona Debate tab shows 'awaiting telemetry' indefinitely because there is no backend route that runs the multi-persona synthesis pipeline. Fix: add `@router.post('/ailab/debate')` that accepts `{topic: str}` and calls each module persona sequentially via the internal AI endpoint (`http://127.0.0.1:8000/api/chat/chat`), returning `{rounds: [{persona, statement}], synthesis: str}`. The frontend must POST to this endpoint when the Debate tab loads or the user clicks 'Start Debate'. Per AI LAB DEBATE ENDPOINT MANDATE."
+    },
+    {
+      "id": "HAZARD_FLOOD_MARKERS",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["Floods", "floods", "flood_count", "floodCount", "active_floods"],
+      "guard_pattern": "flood.*marker|flood.*circle|flood.*layer|L\\.circle.*flood|flood.*L\\.circle|floodFeatures|flood_features|flood.*coordinates|flood.*lat.*lon",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE", "DOTALL"],
+      "error_category": "UI_ERROR",
+      "error_message": "HAZARD FLOOD MARKERS MANDATE violated — the Hazard Center shows a flood count in the summary cards but no flood markers appear on the map. Flood data is fetched but the frontend renders zero Leaflet markers/circles for flood events. Fix: when flood data is available (from GDACS, reliefweb, or OpenWeatherMap), plot each flood event as a `L.circle([lat, lon], {color:'#3b82f6', fillOpacity:0.4, radius:50000})` on the Hazard map layer with a popup showing location name, severity, and date. If the API returns a count-only response with no coordinates, display a sidebar list of flood events instead. Per HAZARD FLOOD MARKERS MANDATE."
+    },
+    {
+      "id": "NULLISH_COALESCING_OR_PRECEDENCE",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["??"],
+      "guard_pattern": "[\\w$][\\w$.]*(?:\\?\\.[\\w$]+)*(?:\\[[^\\]]+\\])*(?:\\.[\\w$]+)*\\s*\\?\\?\\s*(?:\\d+(?:\\.\\d+)?|'[^']*'|\"[^\"]*\"|`[^`]*`|\\b(?:null|undefined|false|true)\\b|[\\w$][\\w$.]*(?:\\?\\.[\\w$]+)*(?:\\[[^\\]]+\\])*(?:\\.[\\w$]+)*)\\s*\\|\\|",
+      "fire_when": "guard_present",
+      "flags": ["DOTALL"],
+      "error_category": "SYNTAX_ERROR",
+      "error_message": "NULLISH COALESCING OR PRECEDENCE violated — index.tsx mixes `??` and `||` at the same expression level without parentheses (e.g. `val ?? fallback || default`). esbuild rejects this as a hard syntax error and aborts the entire bundle. Fix: wrap the nullish expression in parentheses: `(val ?? fallback) || default`. Per NULLISH COALESCING OR PRECEDENCE MANDATE."
+    },
+    {
+      "id": "PERSONA_NODE_STATUS_CONSISTENCY",
+      "check_type": "presence_guard",
+      "target": "index.tsx",
+      "trigger_any": ["ANOMALY", "anomaly", "domain_reports", "personaStatus", "nodeStatus"],
+      "guard_pattern": "domain_reports\\[[^\\]]+\\]|precursorData\\.domain_reports|report.*text|persona.*report|node.*status.*report|anomaly.*report",
+      "fire_when": "guard_absent",
+      "flags": ["IGNORECASE", "DOTALL"],
+      "error_category": "UI_ERROR",
+      "error_message": "PERSONA NODE STATUS CONSISTENCY MANDATE violated — persona nodes can show 'ANOMALY' status visually but clicking them shows 'baseline nominal' because the node label status and the domain_report text are sourced from different data fields. Fix: node status badge (ANOMALY/NOMINAL) must be derived from the SAME field as the modal report text — use `precursorData.domain_reports[persona.name]` for both. If the status is ANOMALY, the report text must contain keywords like 'anomaly', 'elevated', 'unusual', or 'detected'. If no domain_reports key exists for a persona, default status to NOMINAL. Per PERSONA NODE STATUS CONSISTENCY MANDATE."
     }
   ]
 }

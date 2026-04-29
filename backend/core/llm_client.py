@@ -374,8 +374,8 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
                 # minimal non-zero budget (512) instead of pivoting away.
                 if "BUDGET 0 IS INVALID" in error_str or "ONLY WORKS IN THINKING MODE" in error_str:
                     if attempt == 0:
-                        narrate(persona_name, f"RETRY: {model} requires thinking mode — retrying with minimal budget (512).")
-                        _minimal_budget = 512
+                        narrate(persona_name, f"RETRY: {model} requires thinking mode — retrying with minimal budget (2048).")
+                        _minimal_budget = 2048
                         continue
                     # Second attempt also failed — break and try next model.
                     break
