@@ -7759,6 +7759,12 @@ async def call_gemini_with_tools(prompt: str, system_instruction: str, category:
                                     _rc_404_content = _rc_404_content.rstrip() + _rc_stub_code
                                 narrate("Isaac Moreno", f"RENDER CHECK 404 REPAIR: Appended {len(_rc_404_still_missing)} auto-stub route(s). Module will render; full implementation required on next rebuild.")
                             merged_blob["app.py"] = _rc_404_content
+                            _rc_404_app_path = os.path.join(config.PROJECT_ROOT, "backend", "modules", module_name, "app.py")
+                            try:
+                                with open(_rc_404_app_path, "w", encoding="utf-8") as _rc_404_ap_f:
+                                    _rc_404_ap_f.write(_rc_404_content)
+                            except Exception:
+                                pass
                             narrate("Isaac Moreno", f"RENDER CHECK 404 REPAIR: app.py patched to add {len(_rc_api_404s)} missing route(s). Rebuilding...")
                             _rc_404_loop = asyncio.get_running_loop()
                             _rc_ir = await _rc_404_loop.run_in_executor(None, lambda: tool_run_integration(f"Integrate {module_name}", module_name=module_name))
