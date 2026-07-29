@@ -4,7 +4,7 @@
     "modules": {
         "weather_and_planetary_intelligence": {
             "name": "weather_and_planetary_intelligence",
-            "description": "High-fidelity, multi-domain planetary intelligence platform integrating multi-source meteorological, seismic, oceanic, and space weather telemetry with a 7-persona AI synthesis pipeline.",
+            "description": "Weather and Planetary Intelligence System \u2014 A premium multi-page atmospheric, oceanic, seismic, space weather, and astronomical intelligence platform. Features real-time multi-model ensemble forecasting with persona-driven AI synthesis, live atmospheric radar with nowcast projection, global hazard monitoring, deep-sky planetary mapping with NASA SkyView integration, and cross-domain precursor analysis powered by seven specialist AI personas.",
             "path": "backend/modules/weather_and_planetary_intelligence",
             "entrypoint": "app.py",
             "ui_link": "index.html",

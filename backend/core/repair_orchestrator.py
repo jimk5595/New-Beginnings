@@ -1,10 +1,10 @@
-import os
 import json
 import logging
 import asyncio
+import os
 import time
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from persona_logger import narrate
 from core.system_status import system_monitor
 from core.integration_engine import get_registry, run_discovery_and_registration
@@ -26,8 +26,28 @@ class RepairOrchestrator:
             cls._instance._monitoring_task = None
             # Tracks last repair attempt time and failure count per module.
             # Prevents infinite repair loops when a bundle is consistently broken.
-            cls._instance._repair_attempts: Dict[str, List] = {}  # name → [last_time, count]
+            cls._instance._repair_attempts = {}  # name → [last_time, count]
+            # Queue of modules whose build pipeline terminated with BUILD FAILED.
+            # Populated by mark_build_failed() (called from llm_router.py at every
+            # terminal failure point). Drained by the monitoring loop, which runs a
+            # render check + targeted repair on each queued module.
+            # Format: {module_name: {"error": str, "queued_at": float}}
+            cls._instance._failed_build_queue = {}
         return cls._instance
+
+    def mark_build_failed(self, module_name: str, error: str) -> None:
+        """
+        Called by the build pipeline (llm_router.py) when a module build terminates
+        with BUILD FAILED after exhausting all internal repair strategies.
+        The monitoring loop drains this queue and attempts repair via the
+        render-check → targeted-LLM path (a different strategy from the build-time
+        repair, which uses deterministic handlers + layout/ui LLM patch).
+        """
+        self._failed_build_queue[module_name] = {
+            "error": error[:500],
+            "queued_at": time.time(),
+        }
+        narrate("Integrity Monitor", f"BUILD FAILURE QUEUED for '{module_name}': {error[:120]}. Monitoring loop will attempt post-build repair.")
 
     async def run_startup_repair_sequence(self):
         """Triggered at platform startup. Full repair sequence led by the debugging team."""
@@ -169,6 +189,30 @@ class RepairOrchestrator:
                             system_monitor.update_mount(mod_name, success=False, log="Missing index.js (Bundle Failure)")
                             await self._trigger_repair_routine(mod_name, "module")
 
+                # 3. Drain the failed-build queue — modules whose build pipeline
+                # terminated with BUILD FAILED are queued by mark_build_failed().
+                # We attempt repair here using a different strategy from the build-
+                # time path: render check → RUN_TARGETED_REPAIR_TASK with actual
+                # browser errors.  Entries older than 30 minutes are discarded
+                # (stale; the user would have retried manually by then).
+                _queue_snapshot = list(self._failed_build_queue.items())
+                for _fbq_mod, _fbq_info in _queue_snapshot:
+                    _fbq_age = time.time() - _fbq_info.get("queued_at", 0)
+                    if _fbq_age > 1800:
+                        self._failed_build_queue.pop(_fbq_mod, None)
+                        narrate("Integrity Monitor", f"FAILED BUILD QUEUE: Discarding stale entry for '{_fbq_mod}' ({_fbq_age/60:.0f} min old).")
+                        continue
+                    _fbq_lock = self.backend_dir / "modules" / _fbq_mod / ".building"
+                    if _fbq_lock.exists():
+                        continue
+                    narrate("Integrity Monitor", f"FAILED BUILD QUEUE: Attempting post-build repair for '{_fbq_mod}' (build error: {_fbq_info.get('error','?')[:80]})...")
+                    self._failed_build_queue.pop(_fbq_mod, None)
+                    _fbq_ok = await self._trigger_repair_routine(_fbq_mod, "module")
+                    if _fbq_ok:
+                        narrate("Integrity Monitor", f"FAILED BUILD QUEUE: Post-build repair SUCCEEDED for '{_fbq_mod}'.")
+                    else:
+                        narrate("Integrity Monitor", f"FAILED BUILD QUEUE: Post-build repair FAILED for '{_fbq_mod}'. Module remains broken.")
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -198,8 +242,16 @@ class RepairOrchestrator:
         else:
             narrate("Marcus Hale", f"Repair for '{target}' failed. Escalating to platform builder.")
 
+    async def _run_render_check(self, module_name: str) -> dict:
+        """Run render check asynchronously in the current event loop."""
+        try:
+            from tools.render_check import check_module_renders
+            return await check_module_renders(module_name)
+        except Exception as e:
+            return {"rendered": False, "error_summary": str(e), "console_errors": [], "functional_failures": []}
+
     async def _trigger_repair_routine(self, target: str, category: str) -> bool:
-        """Automated repair routine. Identifies broken/mocked files and rewrites them via LLM."""
+        """Automated repair routine. Runs render check first to get actual errors, then repairs with targeted LLM context, then verifies the fix."""
         now = time.time()
         attempts = self._repair_attempts.get(target, [0, 0])
         if attempts[1] >= 3 and (now - attempts[0]) < 300:
@@ -212,27 +264,38 @@ class RepairOrchestrator:
         self._repair_attempts[target] = attempts
 
         narrate("System", f"Executing targeted repair for {category} '{target}'...")
-        
-        log_entry = {
-            "target": target,
-            "category": category,
-            "detected_by": "Alex Rivera" if self.is_monitoring else "Startup sequence",
-            "repaired_by": "Alex Rivera, Mira Kessler & Marcus Hale",
-            "routine": "LLM-powered code repair + re-registration",
-            "timestamp": time.time()
-        }
-        
+
         try:
             if category == "module":
-                # Step 1: Scan the module directory for mock/broken files and rewrite them via LLM
-                from tools.repair import RUN_REPAIR_TASK, MOCK_PATTERNS
+                from tools.repair import RUN_REPAIR_TASK, MOCK_PATTERNS, RUN_TARGETED_REPAIR_TASK
                 from tools.project_map import ProjectMap
+                from core.toolset import RUN_BUILD_SCRIPT
                 import re as _re
 
                 loop = asyncio.get_running_loop()
                 module_dir = self.backend_dir / "modules" / target
-                broken_files = []
+                tsx_path = module_dir / "index.tsx"
 
+                # ── STEP 0: Run render check to get actual runtime errors ──────────────────
+                narrate("Dr. Mira Kessler", f"Running render check diagnostic on '{target}' to identify actual runtime errors...")
+                render_result = await self._run_render_check(target)
+                render_errors = render_result.get("console_errors", [])
+                render_error_summary = render_result.get("error_summary", "")
+                render_func_failures = render_result.get("functional_failures", [])
+                render_passed = render_result.get("rendered", False) and not render_func_failures
+
+                if render_passed:
+                    narrate("Dr. Mira Kessler", f"Render check PASSED for '{target}' — no runtime errors detected. Skipping LLM repair.")
+                    run_discovery_and_registration()
+                    return True
+
+                # Build error context from render check
+                all_render_errors = render_errors + ([render_error_summary] if render_error_summary else []) + render_func_failures
+                error_context = "\n".join(all_render_errors[:15]) if all_render_errors else "Unknown render failure"
+                narrate("Dr. Mira Kessler", f"Render check FAILED for '{target}': {error_context[:200]}")
+
+                # ── STEP 1: Scan for mock/broken patterns ─────────────────────────────────
+                broken_files = []
                 _SKIP_DIRS = {"node_modules", "venv", ".git", "__pycache__", "dist", "build"}
                 if module_dir.exists():
                     for root, dirs, files in os.walk(module_dir):
@@ -249,7 +312,6 @@ class RepairOrchestrator:
                                 except Exception:
                                     pass
 
-                    tsx_path = module_dir / "index.tsx"
                     if tsx_path.exists() and str(tsx_path.name) not in broken_files:
                         try:
                             tsx_content = tsx_path.read_text(encoding="utf-8", errors="ignore")
@@ -258,165 +320,237 @@ class RepairOrchestrator:
                             _net = _o - _c
                             if abs(_net) > 5:
                                 broken_files.append(f"index.tsx (brace imbalance: {_net:+d})")
-                            elif _re.search(r'\};[ \t]*\};', tsx_content):
-                                broken_files.append("index.tsx (same-line cascading close-braces '};}; ')")
-                            else:
-                                _det_qt_carry = False
-                                _det_bc = False
-                                for line_num, line in enumerate(tsx_content.splitlines(), 1):
-                                    in_single = False
-                                    in_double = False
-                                    in_template = _det_qt_carry
-                                    i = 0
-                                    while i < len(line):
-                                        ch = line[i]
-                                        if _det_bc:
-                                            if line[i:i + 2] == '*/':
-                                                _det_bc = False
-                                                i += 2
-                                            else:
-                                                i += 1
-                                            continue
-                                        if not (in_single or in_double or in_template):
-                                            if line[i:i + 2] == '//':
-                                                break
-                                            if line[i:i + 2] == '/*':
-                                                _det_bc = True
-                                                i += 2
-                                                continue
-                                        if ch == '\\' and (in_single or in_double):
-                                            i += 2
-                                            continue
-                                        if ch == '`':
-                                            in_template = not in_template
-                                        elif not in_template:
-                                            if ch == "'" and not in_double:
-                                                in_single = not in_single
-                                            elif ch == '"' and not in_single:
-                                                in_double = not in_double
-                                        i += 1
-                                    _det_qt_carry = in_template
-                                    if in_single or in_double:
-                                        broken_files.append(f"index.tsx (unterminated string literal at line {line_num})")
-                                        break
                         except Exception:
                             pass
 
+                # ── STEP 2: Direct deterministic fixes (unterminated strings, duplicate handlers) ──
                 _tsx_direct_fixed = False
-                _unterminated_entries = [f for f in broken_files if "unterminated string literal" in f]
-                if _unterminated_entries and tsx_path.exists():
+                if tsx_path.exists():
                     try:
-                        _tsx_text = tsx_path.read_text(encoding="utf-8", errors="ignore")
-                        _tsx_ls = _tsx_text.splitlines(keepends=True)
-                        _orch_fixed_count = 0
-                        _orch_qt_carry = False
-                        _orch_bc = False
-                        for _orch_i, _orch_line in enumerate(_tsx_ls):
-                            _orch_qs = False; _orch_qd = False; _orch_qt = _orch_qt_carry
-                            _orch_lqcol = -1; _orch_lqch = None; _orch_ci = 0
-                            while _orch_ci < len(_orch_line):
-                                _orch_ch = _orch_line[_orch_ci]
-                                if _orch_bc:
-                                    if _orch_line[_orch_ci:_orch_ci + 2] == '*/':
-                                        _orch_bc = False; _orch_ci += 2
-                                    else:
-                                        _orch_ci += 1
-                                    continue
-                                if not (_orch_qs or _orch_qd or _orch_qt):
-                                    if _orch_line[_orch_ci:_orch_ci + 2] == '//':
-                                        break
-                                    if _orch_line[_orch_ci:_orch_ci + 2] == '/*':
-                                        _orch_bc = True; _orch_ci += 2; continue
-                                if _orch_ch == '\\' and (_orch_qs or _orch_qd):
-                                    _orch_ci += 2; continue
-                                if _orch_ch == '`':
-                                    _orch_qt = not _orch_qt
-                                elif not _orch_qt:
-                                    if _orch_ch == "'" and not _orch_qd:
-                                        _orch_qs = not _orch_qs
-                                        if _orch_qs: _orch_lqcol = _orch_ci; _orch_lqch = "'"
-                                    elif _orch_ch == '"' and not _orch_qs:
-                                        _orch_qd = not _orch_qd
-                                        if _orch_qd: _orch_lqcol = _orch_ci; _orch_lqch = '"'
-                                _orch_ci += 1
-                            _orch_qt_carry = _orch_qt
-                            if (_orch_qs or _orch_qd) and _orch_lqch and _orch_lqcol >= 0:
-                                _orch_jsx_text_apos = False
-                                if _orch_lqch == "'":
-                                    for _ojxt_i in range(_orch_lqcol - 1, -1, -1):
-                                        if _orch_line[_ojxt_i] == '>':
-                                            _orch_jsx_text_apos = True; break
-                                        if _orch_line[_ojxt_i] in ('{', '<', '(', '"', '='):
-                                            break
-                                if _orch_jsx_text_apos:
-                                    continue
-                                _orch_stripped = _orch_line.rstrip('\r\n')
-                                _orch_has_split = bool(_re.search(r'\.split\(\s*$', _orch_stripped[:_orch_lqcol]))
-                                before_q = _orch_stripped[:_orch_lqcol]
-                                _in_jsx_attr = before_q.rfind('<') > before_q.rfind('>')
-                                if _in_jsx_attr:
-                                    _tsx_ls[_orch_i] = _orch_stripped + _orch_lqch + '/>\n'
-                                elif _orch_has_split:
-                                    _tsx_ls[_orch_i] = _orch_stripped + _orch_lqch + ')\n'
-                                else:
-                                    _tsx_ls[_orch_i] = _orch_stripped + _orch_lqch + '\n'
-                                _orch_fixed_count += 1
-                                narrate("Alex Rivera", f"DIRECT FIX: Closed unterminated {_orch_lqch} string at line {_orch_i + 1} in index.tsx.")
-                        if _orch_fixed_count > 0:
+                        _tsx_dok = tsx_path.read_text(encoding="utf-8", errors="ignore")
+                        _gen_onclick_re = _re.compile(
+                            r"onClick=\{\(e\) => e\.currentTarget\.classList\.toggle\('active'\)\}(?=onClick=\{)"
+                        )
+                        if _gen_onclick_re.search(_tsx_dok):
+                            _fixed_dok = _gen_onclick_re.sub('', _tsx_dok)
+                            tsx_path.write_text(_fixed_dok, encoding='utf-8')
                             _tsx_direct_fixed = True
-                            tsx_path.write_text(''.join(_tsx_ls), encoding="utf-8")
-                            for _ue in list(_unterminated_entries):
-                                if _ue in broken_files:
-                                    broken_files.remove(_ue)
-                    except Exception as _dfe:
-                        narrate("Alex Rivera", f"Direct TSX fix failed: {_dfe}")
+                            narrate("Alex Rivera", "DIRECT FIX: Removed duplicate generic onClick handler.")
+                    except Exception as _dce:
+                        narrate("Alex Rivera", f"Direct fix failed: {_dce}")
 
-                if broken_files:
-                    narrate("Alex Rivera", f"Found {len(broken_files)} broken file(s) in '{target}': {', '.join(broken_files)}. Repairing...")
-                    task_text = f"fix mock and placeholder code in module {target}: {', '.join(broken_files)}"
-                    project_map = ProjectMap()
-                    repair_result = await loop.run_in_executor(
-                        None,
-                        lambda: RUN_REPAIR_TASK(task_text, project_map, module_dir=str(module_dir))
+                # ── STEP 3: LLM-targeted repair with render check errors as context ────────
+                narrate("Alex Rivera", f"Dispatching targeted repair for '{target}' with render errors as context...")
+                repair_task = (
+                    f"Fix runtime errors in module '{target}'. "
+                    f"ACTUAL ERRORS FROM BROWSER:\n{error_context}\n\n"
+                    f"Also fix any mock/placeholder code. Files with issues: {', '.join(broken_files) if broken_files else 'index.tsx (render failure)'}."
+                )
+                project_map = ProjectMap()
+                repair_result = await loop.run_in_executor(
+                    None,
+                    lambda: RUN_TARGETED_REPAIR_TASK(
+                        task_text=repair_task,
+                        module_name=target,
+                        error_context=error_context,
+                        project_map=project_map,
+                        module_dir=str(module_dir),
                     )
-                    narrate("Alex Rivera", f"Repair result: {repair_result}")
+                )
+                narrate("Alex Rivera", f"Repair result: {repair_result}")
+
+                # ── STEP 4: Rebuild ───────────────────────────────────────────────────────
+                narrate("Integrity Monitor", f"Rebuilding bundle for '{target}'...")
+                build_output = await loop.run_in_executor(None, lambda: RUN_BUILD_SCRIPT(module_name=target))
+                if "FAILED" in build_output or "ERROR" in build_output:
+                    narrate("Integrity Monitor", f"Rebuild failed for '{target}': {build_output[:300]}")
                 else:
-                    narrate("Alex Rivera", f"No mock/broken patterns found in '{target}' files.")
+                    narrate("Integrity Monitor", f"Rebuild succeeded for '{target}'.")
 
-                # Step 2: Rebuild bundle via esbuild
-                built_js = self.backend_dir / "static" / "built" / "modules" / target / "index.js"
-                if not built_js.exists() or broken_files:
-                    narrate("Integrity Monitor", f"Triggering esbuild rebuild for '{target}'...")
-                    try:
-                        from core.toolset import RUN_BUILD_SCRIPT
-                        build_output = await loop.run_in_executor(None, lambda: RUN_BUILD_SCRIPT(module_name=target))
-                        if "FAILED" in build_output or "ERROR" in build_output:
-                            narrate("Integrity Monitor", f"Rebuild failed for '{target}': {build_output[:300]}")
-                        else:
-                            narrate("Integrity Monitor", f"Rebuild succeeded for '{target}'.")
-                    except Exception as build_err:
-                        narrate("Integrity Monitor", f"Rebuild error for '{target}': {build_err}")
+                # ── STEP 5: Re-run render check to verify fix ─────────────────────────────
+                narrate("Dr. Mira Kessler", f"Verifying fix with post-repair render check on '{target}'...")
+                verify_result = await self._run_render_check(target)
+                verify_passed = verify_result.get("rendered", False) and not verify_result.get("functional_failures", [])
+                if verify_passed:
+                    narrate("Dr. Mira Kessler", f"POST-REPAIR RENDER CHECK PASSED for '{target}' — fix verified.")
+                else:
+                    verify_errors = verify_result.get("console_errors", []) + verify_result.get("functional_failures", [])
+                    narrate("Dr. Mira Kessler", f"POST-REPAIR RENDER CHECK FAILED for '{target}': {'; '.join(verify_errors[:5])}")
 
-                # Step 3: Re-sync registry
+                # ── STEP 6: Re-sync registry and validate ─────────────────────────────────
                 run_discovery_and_registration()
-
-                # Step 4: Validate structural integrity
                 is_valid = validate_module(target)
-                log_entry["success"] = is_valid
                 narrate("System", f"Repair status for '{target}': {'SUCCESS' if is_valid else 'FAILED'}")
                 return is_valid
 
             elif category == "platform":
                 narrate("System", f"ESCALATION: Platform-level failure in '{target}'. Triggering full sync...")
                 run_discovery_and_registration()
-                log_entry["success"] = True
-                return True
+                is_valid = validate_module(target) if target else True
+                narrate("System", f"Platform sync status for '{target}': {'SUCCESS' if is_valid else 'FAILED'}")
+                return is_valid
 
         except Exception as e:
             narrate("System", f"CRITICAL: Repair routine encountered error: {e}")
-            log_entry["success"] = False
             return False
-            
+
         return False
+
+    async def run_diagnostic(self, module_name: str) -> dict:
+        """
+        Full diagnostic report for a module. Called by personas or API to understand what is broken.
+        Returns: build errors, render check results, mock pattern scan, and a plain-English summary.
+        """
+        from tools.repair import MOCK_PATTERNS
+        from core.toolset import RUN_BUILD_SCRIPT
+        import re as _re
+
+        module_dir = self.backend_dir / "modules" / module_name
+        report = {
+            "module": module_name,
+            "timestamp": time.time(),
+            "build_errors": [],
+            "render_errors": [],
+            "functional_failures": [],
+            "api_errors": {},
+            "mock_files": [],
+            "source_sizes": {},
+            "overall_health": "UNKNOWN",
+            "summary": "",
+        }
+
+        if not module_dir.exists():
+            report["overall_health"] = "ERROR"
+            report["summary"] = f"Module directory not found: {module_dir}"
+            return report
+
+        for f in ["index.tsx", "app.py", "module.json"]:
+            fp = module_dir / f
+            if fp.exists():
+                report["source_sizes"][f] = fp.stat().st_size
+
+        loop = asyncio.get_running_loop()
+        build_out = await loop.run_in_executor(None, lambda: RUN_BUILD_SCRIPT(module_name=module_name))
+        for line in build_out.splitlines():
+            if any(k in line.lower() for k in ("error", "failed", "cannot find", "expected")):
+                report["build_errors"].append(line.strip())
+        report["build_errors"] = report["build_errors"][:20]
+
+        render_result = await self._run_render_check(module_name)
+        report["render_errors"] = render_result.get("console_errors", [])[:20]
+        report["functional_failures"] = render_result.get("functional_failures", [])
+        report["api_errors"] = {
+            "404": render_result.get("api_404s", []),
+            "500": render_result.get("api_500s", []),
+            "422": render_result.get("api_422s", []),
+            "hang": render_result.get("api_hang", []),
+        }
+        if render_result.get("error_summary"):
+            report["render_errors"].insert(0, render_result["error_summary"])
+
+        SKIP_DIRS = {"node_modules", "venv", ".git", "__pycache__", "dist", "build"}
+        for root, dirs, files in os.walk(module_dir):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for file in files:
+                if file.endswith((".py", ".ts", ".tsx")):
+                    fp = Path(root) / file
+                    try:
+                        content = fp.read_text(encoding="utf-8", errors="ignore")
+                        for pat in MOCK_PATTERNS:
+                            if _re.search(pat, content, _re.IGNORECASE):
+                                report["mock_files"].append(file)
+                                break
+                    except Exception:
+                        pass
+
+        total_issues = (
+            len(report["build_errors"]) +
+            len(report["render_errors"]) +
+            len(report["functional_failures"]) +
+            len(report["mock_files"]) +
+            (0 if render_result.get("rendered") else 1)
+        )
+        report["overall_health"] = "HEALTHY" if total_issues == 0 else f"ISSUES: {total_issues} problem(s)"
+
+        parts = []
+        if not render_result.get("rendered"):
+            parts.append(f"Module fails to render: {render_result.get('error_summary', 'blank page')}")
+        if report["build_errors"]:
+            parts.append(f"{len(report['build_errors'])} build error(s): {report['build_errors'][0]}")
+        if report["render_errors"]:
+            parts.append(f"{len(report['render_errors'])} browser error(s): {report['render_errors'][0]}")
+        if report["functional_failures"]:
+            parts.append(f"{len(report['functional_failures'])} functional failure(s): {report['functional_failures'][0]}")
+        if report["mock_files"]:
+            parts.append(f"Mock/placeholder code in: {', '.join(report['mock_files'])}")
+        report["summary"] = " | ".join(parts) if parts else "Module appears healthy."
+
+        narrate("Dr. Mira Kessler", f"Diagnostic for '{module_name}': {report['summary']}")
+        return report
+
+    async def run_ab_test(self, module_name: str, variant_tsx: str) -> dict:
+        """
+        A/B test a proposed index.tsx variant against the current version.
+        Builds and render-checks both, keeps the winner.
+        """
+        from core.toolset import RUN_BUILD_SCRIPT
+        import shutil
+
+        module_dir = self.backend_dir / "modules" / module_name
+        tsx_path = module_dir / "index.tsx"
+        baseline_path = module_dir / "index.tsx.ab_baseline"
+
+        if not tsx_path.exists():
+            return {"error": f"index.tsx not found for '{module_name}'"}
+
+        loop = asyncio.get_running_loop()
+
+        def _score(r: dict) -> int:
+            s = 10 if r.get("rendered") else 0
+            s -= len(r.get("console_errors", []))
+            s -= len(r.get("functional_failures", [])) * 2
+            s -= len(r.get("api_500s", [])) * 3
+            s -= len(r.get("api_hang", [])) * 5
+            s -= len(r.get("api_422s", []))
+            return s
+
+        shutil.copy2(str(tsx_path), str(baseline_path))
+
+        narrate("Dr. Mira Kessler", f"A/B TEST: Building and testing VARIANT for '{module_name}'...")
+        tsx_path.write_text(variant_tsx, encoding="utf-8")
+        await loop.run_in_executor(None, lambda: RUN_BUILD_SCRIPT(module_name=module_name))
+        variant_result = await self._run_render_check(module_name)
+        variant_score = _score(variant_result)
+
+        narrate("Dr. Mira Kessler", f"A/B TEST: Restoring and testing BASELINE for '{module_name}'...")
+        shutil.copy2(str(baseline_path), str(tsx_path))
+        await loop.run_in_executor(None, lambda: RUN_BUILD_SCRIPT(module_name=module_name))
+        baseline_result = await self._run_render_check(module_name)
+        baseline_score = _score(baseline_result)
+
+        winner = "variant" if variant_score >= baseline_score else "baseline"
+        if winner == "variant":
+            tsx_path.write_text(variant_tsx, encoding="utf-8")
+            await loop.run_in_executor(None, lambda: RUN_BUILD_SCRIPT(module_name=module_name))
+        baseline_path.unlink(missing_ok=True)
+
+        narrate("Dr. Mira Kessler",
+            f"A/B TEST RESULT for '{module_name}': {winner.upper()} WINS "
+            f"(variant={variant_score}, baseline={baseline_score}). Kept {winner}.")
+
+        return {
+            "module": module_name,
+            "winner": winner,
+            "baseline_score": baseline_score,
+            "variant_score": variant_score,
+            "baseline_rendered": baseline_result.get("rendered"),
+            "variant_rendered": variant_result.get("rendered"),
+            "baseline_errors": baseline_result.get("console_errors", [])[:5],
+            "variant_errors": variant_result.get("console_errors", [])[:5],
+            "baseline_functional_failures": baseline_result.get("functional_failures", []),
+            "variant_functional_failures": variant_result.get("functional_failures", []),
+            "action": f"Kept {winner}.",
+        }
+
 
 repair_orchestrator = RepairOrchestrator()

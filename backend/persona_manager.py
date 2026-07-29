@@ -72,61 +72,58 @@ class PersonaManager:
         # Walking subdirectories caused module personas to pollute active_personas in the manifest.
         root = PERSONAS_DIR
         files = [f for f in os.listdir(PERSONAS_DIR) if os.path.isfile(os.path.join(PERSONAS_DIR, f))]
-        if True:
-            # Check for department registry JSON
-            if "department_registry.json" in files:
+        if "department_registry.json" in files:
+            try:
+                registry_path = os.path.join(root, "department_registry.json")
+                with open(registry_path, "r", encoding="utf-8") as f:
+                    dept_data = json.load(f)
+                
+                def process_dept(data):
+                    if isinstance(data, list):
+                        for p in data:
+                            pid = p["id"]
+                            self.registry[pid] = {
+                                "id": pid,
+                                "name": p["name"],
+                                "role": p["role"],
+                                "full_content": f"Persona: {p['name']}\nRole: {p['role']}\nExpertise: {', '.join(p['expertise'])}\nPersonality: {p['personality']}\nResources: {', '.join(p['resources'])}",
+                                "tone": p.get("personality", "Professional"),
+                                "type": "json_registry",
+                                "domain": self._infer_domain(p["role"] + " " + " ".join(p["expertise"]))
+                            }
+                            logger.info(f"Loaded registry persona: {pid}")
+                    elif isinstance(data, dict):
+                        for key, value in data.items():
+                            process_dept(value)
+
+                if "sub_departments" in dept_data:
+                    process_dept(dept_data["sub_departments"])
+                if "director" in dept_data:
+                    d = dept_data["director"]
+                    self.registry[d["id"]] = {
+                        "id": d["id"],
+                        "name": d["name"],
+                        "role": d["role"],
+                        "full_content": f"Persona: {d['name']}\nRole: {d['role']}\nPersonality: {d['personality']}\nResources: {', '.join(d['resources'])}",
+                        "tone": d.get("personality", "Professional"),
+                        "type": "json_registry",
+                        "domain": self._infer_domain(d["role"])
+                    }
+            except Exception as e:
+                logger.error(f"Failed to load department registry in {root}: {e}")
+
+        for filename in files:
+            if filename.endswith(".md"):
+                file_path = os.path.join(root, filename)
+                persona_id = filename[:-3]
                 try:
-                    registry_path = os.path.join(root, "department_registry.json")
-                    with open(registry_path, "r", encoding="utf-8") as f:
-                        dept_data = json.load(f)
-                    
-                    # Process sub-departments recursively
-                    def process_dept(data):
-                        if isinstance(data, list):
-                            for p in data:
-                                pid = p["id"]
-                                self.registry[pid] = {
-                                    "id": pid,
-                                    "name": p["name"],
-                                    "role": p["role"],
-                                    "full_content": f"Persona: {p['name']}\nRole: {p['role']}\nExpertise: {', '.join(p['expertise'])}\nPersonality: {p['personality']}\nResources: {', '.join(p['resources'])}",
-                                    "tone": p.get("personality", "Professional"),
-                                    "type": "json_registry",
-                                    "domain": self._infer_domain(p["role"] + " " + " ".join(p["expertise"]))
-                                }
-                                logger.info(f"Loaded registry persona: {pid}")
-                        elif isinstance(data, dict):
-                            for key, value in data.items():
-                                process_dept(value)
-
-                    if "sub_departments" in dept_data:
-                        process_dept(dept_data["sub_departments"])
-                    if "director" in dept_data:
-                        d = dept_data["director"]
-                        self.registry[d["id"]] = {
-                            "id": d["id"],
-                            "name": d["name"],
-                            "role": d["role"],
-                            "full_content": f"Persona: {d['name']}\nRole: {d['role']}\nPersonality: {d['personality']}\nResources: {', '.join(d['resources'])}",
-                            "tone": d.get("personality", "Professional"),
-                            "type": "json_registry",
-                            "domain": self._infer_domain(d["role"])
-                        }
+                    persona_data = self._parse_persona_file(file_path)
+                    persona_data["id"] = persona_id
+                    persona_data["type"] = "markdown"
+                    self.registry[persona_id] = persona_data
+                    logger.info(f"Loaded markdown persona: {persona_id}")
                 except Exception as e:
-                    logger.error(f"Failed to load department registry in {root}: {e}")
-
-            for filename in files:
-                if filename.endswith(".md"):
-                    file_path = os.path.join(root, filename)
-                    persona_id = filename[:-3]
-                    try:
-                        persona_data = self._parse_persona_file(file_path)
-                        persona_data["id"] = persona_id
-                        persona_data["type"] = "markdown"
-                        self.registry[persona_id] = persona_data
-                        logger.info(f"Loaded markdown persona: {persona_id}")
-                    except Exception as e:
-                        logger.error(f"Failed to parse markdown persona {filename}: {e}")
+                    logger.error(f"Failed to parse markdown persona {filename}: {e}")
 
         # 2. Load Python Personas (Legacy/Class-based)
         try:

@@ -13,6 +13,9 @@ class Config:
         self.ENV = os.getenv("ENV", "development")
         self.DATABASE_URL = os.getenv("DATABASE_URL")
         self.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+        self.DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+        self.ALIBABA_API_KEY = os.getenv("ALIBABA_API_KEY", "")
+        self.ALIBABA_API_BASE = os.getenv("ALIBABA_API_BASE", "https://ws-ghu2x5pzia8itwe4.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")
         
         # Local model directories (models are in backend/models)
         self.MODEL_DIR = os.path.join(self.PROJECT_ROOT, "backend", "models")
@@ -27,6 +30,7 @@ class Config:
         self.MODEL_WHISPER = os.path.join(self.MODEL_DIR, "Whisper")
         
         # Explicit Gemini models
+        self.GEMINI_MODEL_35_FLASH = "gemini-3.5-flash"
         self.GEMINI_MODEL_31_CUSTOMTOOLS = "gemini-3.1-pro-preview-customtools"
         self.GEMINI_MODEL_31_PRO = "gemini-3.1-pro-preview"
         self.GEMINI_MODEL_31_FLASH_LITE = "gemini-3.1-flash-lite-preview"
@@ -36,4 +40,14 @@ class Config:
         self.GEMINI_MODEL_25_FLASH = "gemini-2.5-flash"
         
         # Default model
-        self.DEFAULT_MODEL = self.GEMINI_MODEL_31_FLASH_LITE
+        self.DEFAULT_MODEL = os.getenv("QWEN_PLUS_MODEL", "qwen3.7-plus-2026-05-26")
+
+        # DeepSeek models (OpenAI-compatible API).
+        # Env-overridable so swapping tiers (deepseek-chat / deepseek-reasoner /
+        # deepseek-v4-pro / deepseek-v4-flash) requires only a .env change —
+        # never a code change.
+        self.MODEL_DEEPSEEK_V4_PRO = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+        self.MODEL_DEEPSEEK_FLASH = os.getenv("DEEPSEEK_FLASH_MODEL", "deepseek-v4-flash")
+
+        self.MODEL_QWEN_MAX = os.getenv("QWEN_MAX_MODEL", "qwen3.7-max-2026-06-08")
+        self.MODEL_QWEN_PLUS = os.getenv("QWEN_PLUS_MODEL", "qwen3.7-plus-2026-05-26")

@@ -13,6 +13,45 @@ from persona_logger import narrate
 
 logger = logging.getLogger("BuildGate")
 
+# Punctuation/operators after which a "/" begins a JS/TS regex literal rather
+# than a division operator. Used by the string/template scanners so that
+# backticks or quotes INSIDE a regex literal (e.g. /`([^`]*)`/g or /it's/)
+# do not corrupt template/string state tracking and produce phantom
+# "unterminated string literal" / "unclosed template literal" errors that NO
+# repair can satisfy (the source is already valid).
+_REGEX_PREV_CHARS = set("(,=:[!&|?{};+-*%<>~^")
+
+
+def _scan_regex_literal_end(line: str, i: int):
+    """Given line[i] == '/' that begins a regex literal, return the index just
+    past the closing '/<flags>'. Returns None if the regex is not closed on
+    this single line (caller then treats '/' as an ordinary character)."""
+    j = i + 1
+    n = len(line)
+    in_class = False
+    while j < n:
+        c = line[j]
+        if c == '\\':
+            j += 2
+            continue
+        if in_class:
+            if c == ']':
+                in_class = False
+            j += 1
+            continue
+        if c == '[':
+            in_class = True
+            j += 1
+            continue
+        if c == '/':
+            j += 1
+            while j < n and line[j].isalpha():
+                j += 1
+            return j
+        j += 1
+    return None
+
+
 class BuildGate:
     REQUIRED_FILES = [
         "module.json", "app.py", "index.html", "index.tsx", "styles.css", ".env"
@@ -131,14 +170,53 @@ class BuildGate:
             if _ctype == "body_guard":
                 _src = app_py if _rule_target == "app.py" else tsx_raw
                 _anchor = _c.get("anchor", "")
-                _idx = _src.find(_anchor)
-                if _idx < 0:
+                # Collect EVERY occurrence of the anchor — the first hit is
+                # often a comment, route-table string, or import reference
+                # rather than the actual @router handler. If we only check
+                # the window around the first hit, deterministic injections
+                # placed at the real handler site (typically the LAST
+                # occurrence) get missed and the validator loops forever.
+                _indices = []
+                _start = 0
+                while True:
+                    _i = _src.find(_anchor, _start)
+                    if _i < 0:
+                        break
+                    _indices.append(_i)
+                    _start = _i + 1
+                if not _indices:
                     continue
-                _body = _src[_idx: _idx + _c.get("body_chars", 3000)]
+                _body_chars = _c.get("body_chars", 3000)
                 _gp = _c.get("guard_pattern")
                 _fp = _c.get("fail_pattern")
-                _guard_found = bool(re.search(_gp, _body, _flags)) if _gp else True
-                _fail_found = bool(re.search(_fp, _body, _flags)) if _fp else False
+                # Look-behind window. A route anchor (e.g. "/space/current" or the
+                # bare word "space") matches the route-path STRING, but the data it
+                # depends on is frequently fetched by helper functions defined just
+                # ABOVE the route (e.g. `async def _fetch_flux()` returning f107
+                # right before `@router.get("/space/current")`). A forward-only
+                # window never sees those helpers, producing false-positive
+                # DATA_ERRORs that NO idiomatic repair can satisfy — the validator
+                # then loops forever. For pure guard_absent mandates (where finding
+                # the guard can only REDUCE false positives) we scan a symmetric
+                # window around the anchor. Forbidden-pattern checks (guard_present
+                # / *_fail_present) stay forward-only so unrelated preceding code
+                # cannot trip them. Override per-rule via "back_chars" in the JSON.
+                _back_chars = _c.get("back_chars")
+                if _back_chars is None:
+                    _back_chars = _body_chars if (_fw == "guard_absent" and not _fp) else 0
+                # Guard satisfied if ANY window contains the guard pattern;
+                # fail-pattern fires only if EVERY window contains it.
+                _guard_found = False
+                _fail_in_all = True if _fp else False
+                for _idx in _indices:
+                    _body = _src[max(0, _idx - _back_chars): _idx + _body_chars]
+                    if _gp and re.search(_gp, _body, _flags):
+                        _guard_found = True
+                    if _fp and not re.search(_fp, _body, _flags):
+                        _fail_in_all = False
+                if not _gp:
+                    _guard_found = True
+                _fail_found = _fail_in_all if _fp else False
                 if _fw == "guard_absent_and_fail_present":
                     if not _guard_found and _fail_found:
                         errors.append(f"{_cat}:{_target_tag} {_msg}")
@@ -297,6 +375,161 @@ class BuildGate:
                 "The assembled file will fail esbuild with 'Unexpected }}'."
             )
 
+        # GENERIC PAREN-BALANCE CHECK — strips strings/comments and tracks paren
+        # depth INSIDE each `${...}` template-literal placeholder. Catches the common
+        # LLM-output failure mode where an expression like
+        # `Math.max(...arr.map(d => Math.max(a,b) - Math.min(a,b)).toFixed(1)` is
+        # missing one closing paren on the outer Math.max(. esbuild will fail with
+        # `Expected ")" but found "}"` when the placeholder's `}` arrives before the
+        # missing `)`. Whole-file paren counts often net to zero (string contents
+        # compensate), so per-placeholder accounting is required. Module-agnostic.
+        try:
+            _pb_src = tsx_content
+            _pb_i = 0
+            _pb_len = len(_pb_src)
+            _pb_open = 0
+            _pb_close = 0
+            _pb_first_neg_line = 0
+            _pb_in_line = 1
+            # State: 0=code, 1=line-comment, 2=block-comment,
+            # 3=single-string, 4=double-string, 5=template-literal,
+            # 6=jsx-text (between > and <)
+            # We approximate JSX text as "outside braces immediately after a >"
+            # but counting parens in JSX text is fine because JSX text rarely has
+            # lone `(` `)`; just skip nothing extra and tolerate noise.
+            _pb_state = 0
+            # Template-literal placeholder depth (when inside ${...})
+            _pb_tpl_stack = []  # stack of brace depths at ${ entry
+            _pb_tpl_brace_depth = 0
+            # Per-placeholder paren-depth tracking. When entering ${ push 0;
+            # increment on (, decrement on ); on placeholder close, value MUST be 0.
+            _pb_placeholder_paren_stack = []
+            _pb_first_unbalanced_line = 0
+            while _pb_i < _pb_len:
+                _pb_ch = _pb_src[_pb_i]
+                _pb_nx = _pb_src[_pb_i + 1] if _pb_i + 1 < _pb_len else ''
+                if _pb_ch == '\n':
+                    _pb_in_line += 1
+                if _pb_state == 1:  # line comment
+                    if _pb_ch == '\n':
+                        _pb_state = 0
+                    _pb_i += 1
+                    continue
+                if _pb_state == 2:  # block comment
+                    if _pb_ch == '*' and _pb_nx == '/':
+                        _pb_state = 0
+                        _pb_i += 2
+                        continue
+                    _pb_i += 1
+                    continue
+                if _pb_state == 3:  # single quote
+                    if _pb_ch == '\\':
+                        _pb_i += 2
+                        continue
+                    if _pb_ch == "'":
+                        _pb_state = 0
+                    _pb_i += 1
+                    continue
+                if _pb_state == 4:  # double quote
+                    if _pb_ch == '\\':
+                        _pb_i += 2
+                        continue
+                    if _pb_ch == '"':
+                        _pb_state = 0
+                    _pb_i += 1
+                    continue
+                if _pb_state == 5:  # template literal raw
+                    if _pb_ch == '\\':
+                        _pb_i += 2
+                        continue
+                    if _pb_ch == '`':
+                        _pb_state = 0
+                        _pb_i += 1
+                        continue
+                    if _pb_ch == '$' and _pb_nx == '{':
+                        # entering placeholder — switch to code, push template marker
+                        _pb_tpl_stack.append(_pb_tpl_brace_depth)
+                        _pb_tpl_brace_depth += 1
+                        _pb_placeholder_paren_stack.append([0, _pb_in_line])
+                        _pb_state = 0
+                        _pb_i += 2
+                        continue
+                    _pb_i += 1
+                    continue
+                # state 0 = code
+                if _pb_ch == '/' and _pb_nx == '/':
+                    _pb_state = 1
+                    _pb_i += 2
+                    continue
+                if _pb_ch == '/' and _pb_nx == '*':
+                    _pb_state = 2
+                    _pb_i += 2
+                    continue
+                if _pb_ch == "'":
+                    _pb_state = 3
+                    _pb_i += 1
+                    continue
+                if _pb_ch == '"':
+                    _pb_state = 4
+                    _pb_i += 1
+                    continue
+                if _pb_ch == '`':
+                    _pb_state = 5
+                    _pb_i += 1
+                    continue
+                if _pb_ch == '{':
+                    if _pb_tpl_stack:
+                        _pb_tpl_brace_depth += 1
+                if _pb_ch == '}':
+                    if _pb_tpl_stack and _pb_tpl_brace_depth - 1 == _pb_tpl_stack[-1]:
+                        # closing ${...} placeholder — return to template literal
+                        _pb_tpl_stack.pop()
+                        _pb_tpl_brace_depth -= 1
+                        _pp = _pb_placeholder_paren_stack.pop() if _pb_placeholder_paren_stack else None
+                        if _pp and _pp[0] != 0 and _pb_first_unbalanced_line == 0:
+                            _pb_first_unbalanced_line = _pp[1]
+                        _pb_state = 5
+                        _pb_i += 1
+                        continue
+                    if _pb_tpl_stack:
+                        _pb_tpl_brace_depth -= 1
+                if _pb_ch == '(':
+                    _pb_open += 1
+                    if _pb_placeholder_paren_stack:
+                        _pb_placeholder_paren_stack[-1][0] += 1
+                elif _pb_ch == ')':
+                    _pb_close += 1
+                    if _pb_close > _pb_open and _pb_first_neg_line == 0:
+                        _pb_first_neg_line = _pb_in_line
+                    if _pb_placeholder_paren_stack:
+                        _pb_placeholder_paren_stack[-1][0] -= 1
+                _pb_i += 1
+            _pb_net = _pb_open - _pb_close
+            if _pb_net > 5:
+                errors.append(
+                    f"SYNTAX_ERROR: index.tsx has unbalanced parentheses: {_pb_open} open vs {_pb_close} close "
+                    f"(net=+{_pb_net}). At least one expression is missing a closing `)` — "
+                    f"esbuild will fail with 'Expected \")\" but found \"}}\"' or similar. "
+                    f"Common cause: `Math.max(...arr.map(d => ...)).toFixed(N)` missing outer close. Regenerate the affected component."
+                )
+            elif _pb_net < -5:
+                errors.append(
+                    f"SYNTAX_ERROR: index.tsx has excess closing parentheses: {_pb_open} open vs {_pb_close} close "
+                    f"(net={_pb_net}, first excess at line ~{_pb_first_neg_line}). "
+                    f"esbuild will fail with 'Unexpected \")\"'. Regenerate the affected component."
+                )
+            if _pb_first_unbalanced_line:
+                errors.append(
+                    f"SYNTAX_ERROR: index.tsx has unbalanced parentheses inside a `${{...}}` template-literal "
+                    f"placeholder near line {_pb_first_unbalanced_line}. The placeholder closes before its "
+                    f"parens balance — esbuild will fail with 'Expected \")\" but found \"}}\"'. "
+                    f"Common cause: `Math.max(...arr.map(d => ...)).toFixed(N)` missing the outer Math.max close paren. "
+                    f"Regenerate the affected component."
+                )
+        except Exception:
+            # Lexer is best-effort — never crash the gate over scanner edge cases.
+            pass
+
         # Truncated component detection — an LLM response cut off mid-JSX leaves dangling
         # operators/keywords immediately before the next const component declaration.
         # Pattern: a line ending with ?? / && / || / , / ( followed by }; on the next line(s)
@@ -318,6 +551,7 @@ class BuildGate:
             _ul_in_single = False
             _ul_in_double = False
             _ul_lqcol = -1
+            _ul_last_sig = ''
             _ul_i = 0
             while _ul_i < len(_ul_line):
                 _ul_ch = _ul_line[_ul_i]
@@ -335,6 +569,14 @@ class BuildGate:
                         _ul_in_block_comment = True
                         _ul_i += 2
                         continue
+                    # Skip JS/TS regex literals so backticks/quotes inside them
+                    # (e.g. /`([^`]*)`/g) never toggle template/string state.
+                    if _ul_ch == '/' and (_ul_last_sig == '' or _ul_last_sig in _REGEX_PREV_CHARS):
+                        _ul_re_end = _scan_regex_literal_end(_ul_line, _ul_i)
+                        if _ul_re_end is not None:
+                            _ul_i = _ul_re_end
+                            _ul_last_sig = '/'
+                            continue
                 if _ul_ch == '\\' and (_ul_in_single or _ul_in_double):
                     _ul_i += 2
                     continue
@@ -347,6 +589,8 @@ class BuildGate:
                             _ul_lqcol = _ul_i
                     elif _ul_ch == '"' and not _ul_in_single:
                         _ul_in_double = not _ul_in_double
+                if not _ul_ch.isspace():
+                    _ul_last_sig = _ul_ch
                 _ul_i += 1
             if _ul_in_single or _ul_in_double:
                 _ul_jsx_text_apos = False
@@ -364,6 +608,101 @@ class BuildGate:
                         f"esbuild will fail with 'Unterminated string literal'. Fix the broken string by closing it with the matching quote."
                     )
                     break
+
+        # TEMPLATE-LITERAL PARITY CHECK: count unescaped backticks outside
+        # strings and comments. An odd parity means a backtick was opened but
+        # never closed — esbuild then mis-parses subsequent template literals
+        # as TS ternary expressions ("Expected ':' but found '{'") far from
+        # the true source line. Root cause is typically a stray triple-fence
+        # ``` left behind by an LLM that produced markdown around its code.
+        _tp_in_sq = False
+        _tp_in_dq = False
+        _tp_in_blk = False
+        _tp_in_line = False
+        _tp_in_tpl = False
+        _tp_tpl_count = 0
+        _tp_first_open_line = -1
+        _tp_lines = tsx_content.splitlines()
+        for _tp_ln, _tp_line in enumerate(_tp_lines, 1):
+            _tp_in_line = False
+            # Single/double-quote string state MUST reset per line: JS/TS string
+            # literals cannot contain a raw newline, so an unbalanced quote is
+            # confined to its own line. Carrying _tp_in_sq/_tp_in_dq across lines
+            # let a lone apostrophe in JSX text (e.g. <div>It's clear</div>) poison
+            # quote parity for the ENTIRE file, which then mis-counts every real
+            # backtick after it and emits a phantom unterminated-template error.
+            # Block-comment (_tp_in_blk) and template-literal (_tp_in_tpl) state
+            # legitimately span lines and are intentionally NOT reset here.
+            _tp_in_sq = False
+            _tp_in_dq = False
+            _tp_last_sig = ''
+            _tp_i = 0
+            while _tp_i < len(_tp_line):
+                _tp_c = _tp_line[_tp_i]
+                if _tp_in_blk:
+                    if _tp_line[_tp_i:_tp_i + 2] == '*/':
+                        _tp_in_blk = False; _tp_i += 2; continue
+                    _tp_i += 1; continue
+                if _tp_in_line:
+                    _tp_i += 1; continue
+                if not _tp_in_sq and not _tp_in_dq and not _tp_in_tpl:
+                    if _tp_line[_tp_i:_tp_i + 2] == '//':
+                        _tp_in_line = True; _tp_i += 2; continue
+                    if _tp_line[_tp_i:_tp_i + 2] == '/*':
+                        _tp_in_blk = True; _tp_i += 2; continue
+                    # Skip regex literals so backticks inside them (e.g.
+                    # /`([^`]*)`/g) are not counted as template-literal fences.
+                    if _tp_c == '/' and (_tp_last_sig == '' or _tp_last_sig in _REGEX_PREV_CHARS):
+                        _tp_re_end = _scan_regex_literal_end(_tp_line, _tp_i)
+                        if _tp_re_end is not None:
+                            _tp_i = _tp_re_end; _tp_last_sig = '/'; continue
+                if _tp_c == '\\' and (_tp_in_sq or _tp_in_dq or _tp_in_tpl):
+                    _tp_i += 2; continue
+                if _tp_in_sq:
+                    if _tp_c == "'": _tp_in_sq = False
+                    _tp_i += 1; continue
+                if _tp_in_dq:
+                    if _tp_c == '"': _tp_in_dq = False
+                    _tp_i += 1; continue
+                if _tp_c == '`':
+                    if not _tp_in_tpl:
+                        _tp_in_tpl = True
+                        _tp_tpl_count += 1
+                        if _tp_first_open_line < 0:
+                            _tp_first_open_line = _tp_ln
+                    else:
+                        _tp_in_tpl = False
+                    _tp_i += 1; continue
+                if _tp_in_tpl:
+                    _tp_i += 1; continue
+                if _tp_c == "'":
+                    _tp_in_sq = True; _tp_i += 1; continue
+                if _tp_c == '"':
+                    _tp_in_dq = True; _tp_i += 1; continue
+                if not _tp_c.isspace():
+                    _tp_last_sig = _tp_c
+                _tp_i += 1
+        if _tp_in_tpl:
+            # JSX-TEXT BACKTICK FALSE-POSITIVE GUARD: the scanner above is NOT
+            # JSX-aware. A literal backtick character that appears as JSX text
+            # content (between JSX tags) is counted as a template-literal
+            # opener, but esbuild treats it as plain JSX text. If the file ends
+            # in a complete top-level statement (e.g. `createRoot(...).render(...);`)
+            # the parity miscount is a JSX false-positive — flagging it makes
+            # the repair pipeline blindly append a backtick at EOF that
+            # esbuild then rejects as 'Unterminated string literal' (the very
+            # bug this check was meant to prevent).
+            _tp_trailing = tsx_content.rstrip()
+            _tp_last_stmt_ok = bool(
+                re.search(r'(?:\)|\}|;|>)\s*$', _tp_trailing)
+                and not re.search(r'`\s*$', _tp_trailing)
+            )
+            if not _tp_last_stmt_ok:
+                errors.append(
+                    f"SYNTAX_ERROR: index.tsx has an unclosed template literal — backtick opened (first unclosed near line {_tp_first_open_line}) but never closed. "
+                    f"esbuild will mis-parse downstream template literals as TypeScript ternaries (\"Expected ':' but found '{{'\") thousands of lines later. "
+                    f"Strip any stray markdown ``` fences and re-balance backticks."
+                )
 
         _regex_open_lines = [
             i + 1 for i, ln in enumerate(tsx_content.splitlines())
@@ -481,17 +820,23 @@ class BuildGate:
 
         # Duplicate route path check — FastAPI uses only the first matching route, silently ignoring the rest.
         # Duplicates typically come from multiple domain generators writing the same endpoint path.
-        _route_paths = _re_proxy.findall(r'@router\.(?:get|post|put|delete)\(["\']([^"\']+)["\']', app_py)
-        _seen_paths = {}
-        for _rp in _route_paths:
-            if _rp in _seen_paths:
+        # Key on (METHOD, path): FastAPI dispatches per (method, path) pair, so
+        # `@router.get("/items")` and `@router.post("/items")` are BOTH valid and
+        # must NOT be flagged as duplicates. Keying on path alone produced a false
+        # CONTRACT_ERROR for every REST resource that exposes GET + POST/PUT/DELETE
+        # on the same path — a routine, correct pattern.
+        _route_pairs = _re_proxy.findall(r'@router\.(get|post|put|delete|patch)\(["\']([^"\']+)["\']', app_py)
+        _seen_pairs = {}
+        for _rm, _rp in _route_pairs:
+            _key = (_rm.lower(), _rp)
+            if _key in _seen_pairs:
                 errors.append(
-                    f"CONTRACT_ERROR: app.py defines duplicate route path '{_rp}'. "
+                    f"CONTRACT_ERROR: app.py defines duplicate route path '{_rp}' for method {_rm.upper()}. "
                     f"FastAPI registers only the first occurrence — all others are silently ignored, "
-                    f"causing incorrect responses. Each route path must be unique."
+                    f"causing incorrect responses. Each (method, path) pair must be unique."
                 )
                 break
-            _seen_paths[_rp] = True
+            _seen_pairs[_key] = True
 
         # Weak RETURNS CONTRACT check — `# Returns: {fieldname}` with only one bare identifier
         # gives the frontend no information about list item fields, causing field-name mismatches.
@@ -816,23 +1161,22 @@ class BuildGate:
             # Every fetch('/api/MODULE/path') in TSX must have a matching
             # @router.get/post('/path') in app.py. Missing routes cause 404.
             _frontend_fetch_paths = set()
-            # Strip JavaScript regex literals first so route paths inside
-            # `path.match(/\/weather\/current$/)` style code are not picked up
-            # as "missing fetch routes" — those `$`-anchored strings can never
-            # have a backend match because `$` is not legal in a FastAPI route
-            # path. Same protection blocks `/...\b/`, `/...*/`, etc.
-            _tsx_no_regex = _re_proxy.sub(
-                r"/(?:\\.|[^/\\\n])+/[gimsuy]*",
-                "",
-                _original_tsx,
-            )
+            # Extract fetch('/api/MODULE/path') URLs by searching specifically
+            # for fetch( string ) call sites in the original tsx. This avoids the
+            # previous approach of stripping JS regex literals first, which
+            # accidentally destroyed URL path segments like /api/ and /ocean/climate
+            # because the regex literal pattern /token/ matched URL segments too —
+            # causing orphan fetches to go undetected and survive as runtime 404s.
             for _fm in _re_proxy.finditer(
-                r"/api/[^/\"'`\)\s]+/([^\"'`\)\s?${}*+\\][^\"'`\)\s?${}*+\\]*)",
-                _tsx_no_regex,
+                r"""fetch\s*\(\s*[`'"]([^`'"]+)[`'"]""",
+                _original_tsx,
             ):
-                _raw = _fm.group(1).rstrip("/")
-                # Hard-skip anything still carrying regex meta-chars or template
-                # placeholders. These never represent a literal HTTP path.
+                _url = _fm.group(1)
+                _api_m = _re_proxy.match(r'/api/[^/]+/(.+)', _url)
+                if not _api_m:
+                    continue
+                _raw = _api_m.group(1).split("?")[0].rstrip("/")
+                # Hard-skip template placeholders and regex meta-chars.
                 if any(c in _raw for c in ("$", "{", "}", "*", "+", "\\", ";")):
                     continue
                 if _raw:
@@ -1165,41 +1509,6 @@ class BuildGate:
                     )
                     break
 
-            # -- SKYVIEW URL ENCODING CHECK -----------------------------------
-            # SkyView survey names contain spaces (e.g. "DSS2 Red"). If the URL
-            # is built with f-string interpolation of the raw survey string,
-            # the space makes the URL malformed and NASA returns HTML instead
-            # of PNG. The backend then base64-encodes the HTML, the frontend
-            # img.onerror fires, and the canvas stays black.
-            _sv_route_idx = _app_py.find("skyview.gsfc.nasa.gov")
-            if _sv_route_idx >= 0:
-                _sv_block = _app_py[max(0, _sv_route_idx - 200):_sv_route_idx + 500]
-                _has_url_encode = bool(_re_proxy.search(
-                    r"(?:quote|quote_plus|urlencode)\s*\(", _sv_block
-                ))
-                _has_content_type_check = bool(_re_proxy.search(
-                    r"content.type|content_type", _sv_block, _re_proxy.IGNORECASE
-                ))
-                if not _has_url_encode:
-                    errors.append(
-                        "RULES_COMPLIANCE: SKYVIEW URL ENCODING MANDATE violated — "
-                        "`skyview.gsfc.nasa.gov` URL built without `urllib.parse.quote()` "
-                        "on the survey parameter. Survey names like 'DSS2 Red' contain spaces "
-                        "that make the URL malformed — NASA returns HTML instead of PNG. "
-                        "Fix: `encoded_survey = urllib.parse.quote(survey, safe='')` "
-                        "then use `?Survey={encoded_survey}&...` in the URL."
-                    )
-                if not _has_content_type_check:
-                    errors.append(
-                        "RULES_COMPLIANCE: SKYVIEW URL ENCODING MANDATE violated — "
-                        "/astronomy/skyview route does not verify `resp.headers['content-type']` "
-                        "starts with 'image/' before base64-encoding. When NASA returns HTML "
-                        "(e.g. on a malformed URL), the backend base64-encodes the HTML page "
-                        "and the frontend silently fails with `img.onerror`. "
-                        "Add: `if not resp.headers.get('content-type','').startswith('image/'): "
-                        "return {'image_url': ''}`"
-                    )
-
             # -- LUCIDE-REACT NATIVE CONSTRUCTOR SHADOW CHECK -----------------
             # `import { ..., Map, ... } from 'lucide-react'` brings a React
             # component named Map into module scope, shadowing the native JS
@@ -1240,109 +1549,290 @@ class BuildGate:
                             )
                             break
 
+            # -- ARRAY NULL SAFETY CHECK --------------------------------------
+            # API routes can fail and return error payloads without expected
+            # array keys. When `setFooData(data)` replaces initial state
+            # `{ items: [] }` with `{ error: '...' }`, any code accessing
+            # `fooData.items.map(...)` without `?.` crashes: "Cannot read
+            # properties of undefined (reading 'map')".
+            # Pattern: word.word.(arrayMethod)( with no `?.` before the method.
+            # The `(?<![?.])` lookbehind ensures we only flag expressions that
+            # START at a fresh identifier (not mid-chain, not already optional).
+            _unsafe_array_re = _re_proxy.compile(
+                r'(?<![?.])\b\w+\.\w+\.(?:map|reduce|filter|forEach|slice|find|findIndex|some|every)\s*\(',
+            )
+            _unsafe_array_matches = _unsafe_array_re.findall(_tsx_raw)
+            # Exclude legitimate false-positives: library method chains, prototype
+            # calls, and expressions where the second word contains 'prototype',
+            # 'length', 'toString', 'constructor' or is a capitalized class name.
+            _safe_identifiers = {
+                'prototype', 'length', 'toString', 'constructor', 'call', 'apply',
+                'bind', 'name', 'type', 'key', 'value', 'props', 'state', 'ref',
+            }
+            _true_unsafe = [
+                m for m in _unsafe_array_matches
+                if not any(s in m.lower() for s in _safe_identifiers)
+                and not _re_proxy.search(r'\b[A-Z][a-z]\w*\.', m)
+            ]
+            if len(_true_unsafe) >= 2:
+                errors.append(
+                    f"RULES_COMPLIANCE: ARRAY NULL SAFETY MANDATE violated — "
+                    f"index.tsx contains {len(_true_unsafe)} array method call(s) on object "
+                    f"properties without optional chaining: e.g. `{_true_unsafe[0].strip()}`. "
+                    f"When an API route returns an error payload (missing the expected array key), "
+                    f"`data.items.map(...)` crashes with 'Cannot read properties of undefined'. "
+                    f"Fix: add `?.` before every array method call on state-derived properties: "
+                    f"`data.items?.map(...)`, `data.items?.reduce(...)`, `data.items?.forEach(...)`. "
+                    f"Per ARRAY NULL SAFETY MANDATE."
+                )
+
+            # -- HOOKS AFTER EARLY RETURN CHECK (React error #310) -----------
+            # React rule: hooks must be called in the same order on EVERY render.
+            # When a component has an early `return` BEFORE a hook call (useMemo,
+            # useCallback, useRef, etc.), React calls a different number of hooks
+            # on the first render vs subsequent renders → error #310
+            # "Rendered more hooks than during the previous render."
+            # Strategy: for each top-level *View component, scan the body for
+            # early return statements (lines that are `return ...` NOT inside a
+            # JSX block) that appear before any hook call.
+            # Reliable detection requires accurate brace nesting, which is
+            # impossible while string literals, template literals, comments, and
+            # regex literals contribute stray '{','}','<','>' to the count — the
+            # naive char scanner used previously drifted and produced FALSE
+            # POSITIVES (e.g. flagging a `<React.useEffect` token embedded inside
+            # returned JSX, or `return` statements inside a nested helper). A false
+            # positive here is unsatisfiable by any repair and stalls the build
+            # forever. We therefore (1) MASK out the contents of strings/templates/
+            # comments so brace depth is exact, and (2) only flag a hook that is a
+            # genuine STATEMENT (it begins its line, optionally as `const x = `) —
+            # never a hook-looking token inside JSX (`<React.useEffect`) or a JSX
+            # expression (`{useX()}`). High precision is the goal: a missed true
+            # positive merely surfaces at runtime (status quo for a runtime error),
+            # whereas a false positive blocks an otherwise-valid build.
+            def _mask_code_for_scan(_s):
+                _out = list(_s)
+                _i = 0
+                _n = len(_s)
+                _state = None  # 'sq','dq','tpl','line','block'
+                while _i < _n:
+                    _c = _s[_i]
+                    if _state is None:
+                        if _c == '/' and _i + 1 < _n and _s[_i + 1] == '/':
+                            _state = 'line'; _out[_i] = ' '; _out[_i + 1] = ' '; _i += 2; continue
+                        if _c == '/' and _i + 1 < _n and _s[_i + 1] == '*':
+                            _state = 'block'; _out[_i] = ' '; _out[_i + 1] = ' '; _i += 2; continue
+                        if _c == "'":
+                            _state = 'sq'; _out[_i] = ' '; _i += 1; continue
+                        if _c == '"':
+                            _state = 'dq'; _out[_i] = ' '; _i += 1; continue
+                        if _c == '`':
+                            _state = 'tpl'; _out[_i] = ' '; _i += 1; continue
+                        _i += 1; continue
+                    if _state == 'line':
+                        if _c == '\n':
+                            _state = None
+                        else:
+                            _out[_i] = ' '
+                        _i += 1; continue
+                    if _state == 'block':
+                        if _c == '*' and _i + 1 < _n and _s[_i + 1] == '/':
+                            _out[_i] = ' '; _out[_i + 1] = ' '; _state = None; _i += 2; continue
+                        if _c != '\n':
+                            _out[_i] = ' '
+                        _i += 1; continue
+                    # inside sq / dq / tpl
+                    if _c == '\\' and _i + 1 < _n:
+                        _out[_i] = ' '; _out[_i + 1] = ' '; _i += 2; continue
+                    if (_state == 'sq' and _c == "'") or (_state == 'dq' and _c == '"') or (_state == 'tpl' and _c == '`'):
+                        _out[_i] = ' '; _state = None; _i += 1; continue
+                    if _c != '\n':
+                        _out[_i] = ' '
+                    _i += 1; continue
+                return ''.join(_out)
+
+            _hook_alt = (
+                r'(?:useMemo|useCallback|useRef|useEffect|useState|useContext|'
+                r'useReducer|useLayoutEffect|useImperativeHandle)'
+            )
+            _comp_decl_re = _re_proxy.compile(
+                r'(?:const\s+\w+View\w*\s*(?::[^=]*)?\s*=\s*(?:async\s*)?\(\s*\)\s*=>\s*\{|'
+                r'function\s+\w+View\w*\s*\([^)]*\)\s*\{)'
+            )
+            # A hook used as a STATEMENT: the (optionally assigned) hook call begins
+            # the (lstripped) line. Rejects `<React.useEffect` and `{useX()}`.
+            _hook_stmt_re = _re_proxy.compile(
+                r'^(?:export\s+)?(?:(?:const|let|var)\s+[\w{}\[\],:\s]+=\s*)?'
+                r'(?:await\s+)?(?:React\s*\.\s*)?' + _hook_alt + r'\s*[(<]'
+            )
+            _comp_name_re = _re_proxy.compile(r'(?:const|function)\s+(\w+)')
+            _return_kw_re = _re_proxy.compile(r'\breturn\b')
+            _masked_tsx = _mask_code_for_scan(_tsx_raw)
+            _masked_lines = _masked_tsx.split('\n')
+            _orig_lines = _tsx_raw.split('\n')
+            _early_return_violations = []
+            for _hm in _comp_decl_re.finditer(_masked_tsx):
+                _hbody_start = _hm.end()
+                # Walk the masked body recording brace depth at each line start.
+                _h_depth = 1
+                _h_pos = _hbody_start
+                _hn = len(_masked_tsx)
+                _cur_line = _masked_tsx.count('\n', 0, _hbody_start)
+                _line_start_depth = {_cur_line: 1}
+                while _h_pos < _hn and _h_depth > 0:
+                    _hc = _masked_tsx[_h_pos]
+                    if _hc == '{':
+                        _h_depth += 1
+                    elif _hc == '}':
+                        _h_depth -= 1
+                        if _h_depth == 0:
+                            break
+                    elif _hc == '\n':
+                        _line_start_depth[_cur_line + 1] = _h_depth
+                        _cur_line += 1
+                    _h_pos += 1
+                _start_line = _masked_tsx.count('\n', 0, _hbody_start)
+                _end_line = _masked_tsx.count('\n', 0, _h_pos)
+                _h_first_return_line = None
+                _h_first_hook_after_return = None
+                for _ln in range(_start_line, _end_line + 1):
+                    if _line_start_depth.get(_ln) != 1:
+                        continue
+                    _mline = _masked_lines[_ln] if _ln < len(_masked_lines) else ''
+                    if _h_first_return_line is None:
+                        if _return_kw_re.search(_mline):
+                            _h_first_return_line = _ln
+                        continue
+                    if _ln > _h_first_return_line and _hook_stmt_re.match(_mline.lstrip()):
+                        _hk = _hook_stmt_re.search(_mline.lstrip())
+                        _h_first_hook_after_return = _re_proxy.search(_hook_alt, _hk.group(0)).group(0)
+                        break
+                if _h_first_hook_after_return:
+                    _cn_m = _comp_name_re.search(_tsx_raw[_hm.start():_hm.end()])
+                    _comp_name = _cn_m.group(1) if _cn_m else "component"
+                    _early_return_violations.append(f"{_comp_name}: `{_h_first_hook_after_return}` called after early return")
+            if _early_return_violations:
+                errors.append(
+                    f"RULES_COMPLIANCE: HOOKS AFTER EARLY RETURN MANDATE violated — "
+                    f"{len(_early_return_violations)} component(s) call React hook(s) AFTER an early return statement. "
+                    f"React requires hooks to be called in the same order on every render. "
+                    f"Violations: {'; '.join(_early_return_violations[:3])}. "
+                    f"Fix: move ALL hook declarations (useMemo, useCallback, useRef, useEffect, useState) "
+                    f"to the TOP of the component body, BEFORE any conditional return or early return. "
+                    f"Per HOOKS AFTER EARLY RETURN MANDATE."
+                )
+
             # -- EXTERNAL VALIDATION RULES (validation_rules.json) ------------
             # Module-specific route names, variable identifiers, and feature
             # trigger strings live in resources/validation_rules.json — NOT here.
             # This call applies all JSON-defined checks generically.
             self._run_validation_rules(_app_py, _tsx_raw, errors)
 
-            # -- OCEAN SST LAND MASK OPACITY CHECK ----------------------------
-            # dark_nolabels or light_nolabels at opacity > 0.3 on top of SST
-            # tiles is a full-world basemap that covers both land AND ocean,
-            # completely hiding the SST color gradient.
-            # Catches all opacity variants > 0.3: 0.4-0.9x, 1, 1.0, and JSX
-            # attribute form opacity={N} as well as object literal opacity: N.
-            _sst_mask_bad = _re_proxy.search(
-                r"""(?:dark_nolabels|light_nolabels)[^'"]*['"][^}]*opacity\s*[=:]\s*\{?(?:0\.[4-9]\d*|1(?:\.0?)?)\}?""",
-                _tsx_raw
-            )
-            if _sst_mask_bad:
-                errors.append(
-                    "RULES_COMPLIANCE: OCEAN SST TILE VISIBILITY MANDATE violated — "
-                    "a `dark_nolabels` or `light_nolabels` CartoDB tile layer is configured with opacity > 0.3 "
-                    "on top of an SST/temperature data layer. These are full-world tiles that cover BOTH land "
-                    "and ocean — at high opacity they completely hide the SST color gradient over ocean. "
-                    "Fix: replace the full-world land mask with `dark_only_labels` tiles (transparent "
-                    "everywhere except labels) at zIndex 500 and opacity 1.0. "
-                    "Per OCEAN SST TILE VISIBILITY MANDATE."
-                )
-
-            # -- SST TOGGLE NON-FUNCTIONAL CHECK ------------------------------
-            # SST button with empty onClick is a non-functional toggle (UI_ERROR).
-            _sst_empty_click = _re_proxy.search(
-                r"""onClick\s*=\s*\{\s*\(\s*\)\s*=>\s*\{\s*(?:/\*[^*]*\*/\s*)?\}\s*\}""",
-                _tsx_raw
-            )
-            if _sst_empty_click:
-                errors.append(
-                    "UI_ERROR: Empty `onClick={() => { /* ... */ }}` found in index.tsx. "
-                    "At least one interactive button has a non-functional click handler (no state change). "
-                    "This is typically the SST layer toggle button. Every onClick MUST call a state setter "
-                    "or dispatch. FORBIDDEN: onClick with only a comment or empty body. "
-                    "Per OCEAN SST TILE VISIBILITY MANDATE."
-                )
-
-            # -- RAINVIEWER NOWCAST URL SPECIFICITY CHECK ---------------------
-            # The TEMPORAL FRAMES check passes if the word "nowcast" appears
-            # anywhere in the radar route body. But the frontend still shows
-            # "No forecast data" if the backend fetches the WRONG endpoint or
-            # only reads `radar.past` and never `radar.nowcast`. Enforce that
-            # any radar route actually fetches from api.rainviewer.com AND
-            # parses the `nowcast` key from the returned JSON.
-            _radar_route_re = _re_proxy.compile(
-                r"@router\.(?:get|post)\([\"'](/[^\"']*(?:radar|weather-map)[^\"']*)[\"']",
-                _re_proxy.IGNORECASE,
-            )
-            for _rr in _radar_route_re.finditer(_app_py):
-                _rr_start = _rr.end()
-                _rr_body = _app_py[_rr_start:_rr_start + 5000]
-                _next_route = _re_proxy.search(r"\n@router\.", _rr_body)
-                if _next_route:
-                    _rr_body = _rr_body[:_next_route.start()]
-                _has_rainviewer = bool(_re_proxy.search(r"rainviewer\.com", _rr_body))
-                _has_nowcast_parse = bool(_re_proxy.search(
-                    r"""(?:["']nowcast["']|\.nowcast\b|nowcast_frames|get\(['"']nowcast)""",
-                    _rr_body
-                ))
-                if _has_rainviewer and not _has_nowcast_parse:
+            # -- CALL_LLM_ASYNC MODULE-LEVEL IMPORT CHECK ----------------------
+            # The LLM generates call_llm_async() calls in route function bodies
+            # but often omits the top-level import, relying on inline per-function
+            # imports inside SOME functions. Functions that call call_llm_async()
+            # without a preceding local import raise NameError at runtime, which
+            # is caught by the route's except block and silently returns the generic
+            # "Service temporarily unavailable" zero-data fallback. Entire data pages
+            # appear broken with all values at 0 when the APIs themselves succeed.
+            # The PRE-GATE AUTO-FIX injects the import; this gate is the safety net.
+            if "call_llm_async" in _app_py:
+                if not _re_proxy.search(
+                    r'^from\s+core\.llm_client\s+import\s+call_llm_async',
+                    _app_py,
+                    _re_proxy.MULTILINE
+                ):
                     errors.append(
-                        f"DATA_ERROR: app.py radar route `{_rr.group(1)}` fetches from RainViewer "
-                        f"but does not parse the `radar.nowcast` array from the response. "
-                        f"The timeline will show 'No forecast data' even though RainViewer always returns "
-                        f"nowcast frames in `radar.nowcast`. Fix: after fetching "
-                        f"`https://api.rainviewer.com/public/weather-maps.json`, read both "
-                        f"`data['radar']['past']` AND `data['radar']['nowcast']` and return them as "
-                        f"`past_frames` and `nowcast_frames`. Per RADAR FORECAST FRAMES MANDATE."
+                        "DATA_ERROR: CALL_LLM_ASYNC IMPORT MANDATE violated — app.py calls "
+                        "call_llm_async() in one or more route function bodies but has no "
+                        "module-level 'from core.llm_client import call_llm_async'. "
+                        "Functions with the inline import work; functions without it raise "
+                        "NameError at runtime, which the except block catches and returns "
+                        "'Service temporarily unavailable' with all-zero data. "
+                        "Fix: add 'from core.llm_client import call_llm_async' at the TOP of "
+                        "app.py (after the standard imports, before router = APIRouter()). "
+                        "Per CALL_LLM_ASYNC IMPORT MANDATE."
+                    )
+
+            # -- JSX NATIVE BUILTIN COMPONENT USAGE CHECK ---------------------
+            # Lucide icons are aliased (e.g. MapIcon) but LLMs still write <Map>
+            # in JSX, which refers to the native JS Map constructor — React tries
+            # to call it as a function, causing "Constructor Map requires 'new'".
+            # Detect any bare native builtin name used as a JSX opening tag when
+            # it is NOT imported from an icon library under that exact name.
+            _JSX_BUILTIN_TAGS = {
+                "Map", "Set", "Symbol", "Error", "Event", "URL", "Promise",
+                "Date", "Array", "Object", "Function", "Number", "String",
+                "Boolean", "Image", "Text", "Comment", "Range", "Screen",
+                "Selection", "Navigation", "History", "Location", "Document",
+                "Window", "Worker", "Request", "Response", "Headers",
+                "FormData", "Blob", "File",
+            }
+            _icon_import_names = set()
+            for _iim in _re_proxy.finditer(
+                r"import\s*\{([^}]*)\}\s*from\s*['\"](?:lucide-react|@heroicons/react|react-icons/[^'\"]+|phosphor-react)['\"]",
+                _tsx_raw
+            ):
+                for _iit in _re_proxy.finditer(r'\b(\w+)\s+as\s+(\w+)|\b(\w+)\s*[,}]', _iim.group(1)):
+                    if _iit.group(2):
+                        _icon_import_names.add(_iit.group(2))
+                    elif _iit.group(3):
+                        _icon_import_names.add(_iit.group(3))
+            for _jbt in _JSX_BUILTIN_TAGS:
+                if _jbt in _icon_import_names:
+                    continue
+                if _re_proxy.search(rf'<{_jbt}[\s/]', _tsx_raw):
+                    errors.append(
+                        f"RUNTIME_ERROR: index.tsx uses `<{_jbt}` as a JSX component but `{_jbt}` is "
+                        f"the native JavaScript {_jbt} constructor — not a React component. "
+                        f"React calls it as a function without `new`, causing 'Constructor {_jbt} requires "
+                        f"'new'' at runtime and the ErrorBoundary catches the crash. "
+                        f"Fix: if a {_jbt} icon is intended, import it with an alias: "
+                        f"`import {{ {_jbt} as {_jbt}Icon }} from 'lucide-react'` and use `<{_jbt}Icon />`. "
+                        f"If a JS {_jbt} data structure is needed, use `new {_jbt}()` (never as JSX). "
+                        f"Per LUCIDE-REACT NATIVE CONSTRUCTOR SHADOW MANDATE."
                     )
                     break
 
-            # -- HAZARD CENTER MAP OVERFLOW CHECK -----------------------------
-            # Hazard center map containers must NOT use flex-grow, h-full, or
-            # height calculations based on viewport — this pushes bottom hazard
-            # panels (storms/wildfires/floods) below the visible viewport.
-            _has_hazard_view = bool(_re_proxy.search(
-                r'(?:HazardView|HazardCenter|hazard.center|GlobalHazard|hazard.map)',
-                _tsx_raw, _re_proxy.IGNORECASE
-            ))
-            if _has_hazard_view and _app_py:
-                _hazard_overflow = bool(_re_proxy.search(
-                    r'(?:flex-grow|flexGrow|h-full|height\s*:\s*["\']100%|calc\s*\(\s*100vh)',
-                    _tsx_raw
-                ))
-                _hazard_map_ref = bool(_re_proxy.search(
-                    r'(?:hazardMap|mapRef|threatMap)\s*=\s*(?:useRef|L\.map)',
-                    _tsx_raw, _re_proxy.IGNORECASE
-                ))
-                if _hazard_overflow and _hazard_map_ref:
-                    errors.append(
-                        "LAYOUT_ERROR: Hazard Center map container uses `flex-grow`, `h-full`, or "
-                        "`height: 100%` / `calc(100vh - ...)` which causes the map to fill all "
-                        "remaining viewport space and pushes the Active Tropical Storms, Wildfire, "
-                        "and Flood panels below the fold with no scroll indicator. "
-                        "Fix: set `style={{height: '520px', width: '100%'}}` on the map container div. "
-                        "Wrap the entire view in an `overflowY: 'auto'` scrollable column. "
-                        "Per HAZARD CENTER MAP VIEWPORT OVERFLOW MANDATE."
-                    )
+            # -- SVG GROUP CSS HOVER SCALE CHECK ------------------------------
+            # Applying Tailwind hover:scale-* on a <g> element inside <svg
+            # viewBox> causes violent visual shaking on hover. CSS transforms
+            # in the browser's pixel coordinate system conflict with the SVG
+            # internal coordinate system — the element oscillates between
+            # scaled and unscaled states at 60fps (seizure-like effect).
+            # Fix: remove hover:scale-* from all SVG <g> elements and use
+            # SVG-native stroke/opacity hover instead.
+            _svg_g_hover_scale = _re_proxy.search(
+                r'<g\b[^>]*className=["\'][^"\']*hover:scale-',
+                _tsx_raw
+            )
+            if _svg_g_hover_scale:
+                errors.append(
+                    "UI_ERROR: index.tsx applies `hover:scale-*` (Tailwind CSS transform) to a `<g>` "
+                    "element inside an SVG. CSS pixel-space transforms on SVG coordinate-space elements "
+                    "cause violent visual oscillation (seizure-like shaking) on hover — the element "
+                    "rapidly alternates between scaled and unscaled positions at 60fps because the "
+                    "CSS layout engine and SVG coordinate system fight each other. "
+                    "Fix: remove ALL `hover:scale-*` and `transition-transform` classes from `<g>` "
+                    "elements. Use SVG-native hover instead: on mouseEnter set a React state flag "
+                    "and conditionally change `stroke` color or `opacity` on the `<circle>`. "
+                    "FORBIDDEN: Tailwind scale/transform classes on any SVG `<g>`, `<circle>`, "
+                    "`<rect>`, or `<path>` element. Per SVG GROUP HOVER SCALE MANDATE."
+                )
+
+            # -- TRIPLE SEMICOLON IMPORT ARTIFACT CHECK -----------------------
+            # The deterministic import injector occasionally appends an extra `;`
+            # after an existing statement, producing `from 'lib';;;`. While
+            # harmless at runtime, it indicates a broken injection pass that
+            # may have left duplicate or malformed imports.
+            if _re_proxy.search(r"from\s+['\"][^'\"]+['\"]\s*;{2,}", _tsx_raw):
+                errors.append(
+                    "SYNTAX_ERROR: index.tsx contains a triple (or double) semicolon after an import "
+                    "statement (e.g. `from 'lucide-react';;;`). This is caused by the import injector "
+                    "appending a `;` to a line that already ends with `;;`. While esbuild tolerates it, "
+                    "it signals a malformed import injection pass that may have produced duplicate imports. "
+                    "Fix: collapse all consecutive semicolons after import statements to a single `;`."
+                )
 
 
 

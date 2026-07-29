@@ -152,6 +152,92 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
         for att in attachments:
             current_parts += _build_attachment_parts(att)
 
+    # Resolve "default" to the actual configured model before fast-path checks
+    # so that Qwen/DeepSeek fast-paths trigger correctly when model_name="default"
+    if not model_name or model_name == "default":
+        model_name = config.DEFAULT_MODEL
+
+    # Qwen fast-path — intercepts before Gemini chain for planning/building tasks
+    if model_name and model_name.startswith("qwen"):
+        import time as _time
+        from providers.qwen_provider import QwenProvider
+        narrate(persona_name, f"Attempting connection to {model_name} (Qwen/Alibaba)...")
+        try:
+            _qw = QwenProvider()
+            _qw_stop = asyncio.Event()
+
+            async def _qw_heartbeat():
+                _start = _time.time()
+                while not _qw_stop.is_set():
+                    await asyncio.sleep(15)
+                    if not _qw_stop.is_set():
+                        narrate(persona_name, f"Still generating with Qwen (Elapsed: {int(_time.time() - _start)}s)...")
+
+            _qw_system = f"Date: {current_date}\n\n{system_instruction}".strip()
+            _qw_hb_task = asyncio.create_task(_qw_heartbeat())
+            try:
+                _qw_text = await _qw.generate(
+                    system_prompt=_qw_system,
+                    user_prompt=prompt,
+                    max_tokens=max_tokens,
+                    model=model_name,
+                    tools=tools if tools else None,
+                )
+            finally:
+                _qw_stop.set()
+                _qw_hb_task.cancel()
+                try:
+                    await _qw_hb_task
+                except asyncio.CancelledError:
+                    pass
+            narrate(persona_name, f"Qwen response received ({len(_qw_text)} chars).")
+            return {"text": _qw_text, "thought_signature": None}
+        except Exception as _qw_err:
+            narrate(persona_name, f"Qwen failed after retries ({_qw_err}). Task aborted — no fallback configured.")
+            return {"text": f"ERROR: Qwen unavailable — {_qw_err}", "thought_signature": None}
+
+    # DeepSeek fast-path — intercepts before Gemini chain for targeted patch calls
+    if model_name and model_name.startswith("deepseek"):
+        import time as _time
+        from providers.deepseek_provider import DeepSeekProvider
+        narrate(persona_name, f"Attempting connection to {model_name} (DeepSeek)...")
+        try:
+            _ds = DeepSeekProvider()
+            _ds_stop = asyncio.Event()
+
+            async def _ds_heartbeat():
+                _start = _time.time()
+                while not _ds_stop.is_set():
+                    await asyncio.sleep(15)
+                    if not _ds_stop.is_set():
+                        narrate(persona_name, f"Still generating with DeepSeek (Elapsed: {int(_time.time() - _start)}s)...")
+
+            # DeepSeek ignores Gemini-specific <cache-tier-1-immutable> hints,
+            # so strip the cache prefix and only send the date + caller's
+            # system_instruction.  This saves input tokens on every DeepSeek
+            # call (the cache wrapper is ~400 chars repeated per file gen).
+            _ds_system = f"Date: {current_date}\n\n{system_instruction}".strip()
+            _ds_hb_task = asyncio.create_task(_ds_heartbeat())
+            try:
+                _ds_text = await _ds.generate(
+                    system_prompt=_ds_system,
+                    user_prompt=prompt,
+                    max_tokens=max_tokens,
+                    model=model_name,
+                )
+            finally:
+                _ds_stop.set()
+                _ds_hb_task.cancel()
+                try:
+                    await _ds_hb_task
+                except asyncio.CancelledError:
+                    pass
+            narrate(persona_name, f"DeepSeek response received ({len(_ds_text)} chars).")
+            return {"text": _ds_text, "thought_signature": None}
+        except Exception as _ds_err:
+            narrate(persona_name, f"DeepSeek failed ({_ds_err}). Task aborted — no fallback configured.")
+            return {"text": f"ERROR: DeepSeek unavailable — {_ds_err}", "thought_signature": None}
+
     # Proactively use the requested primary
     target_model = model_name if model_name and model_name != "default" else config.DEFAULT_MODEL
     
@@ -165,14 +251,18 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
                 elapsed = int(time.time() - start_time)
                 narrate(persona, f"Still requesting high-fidelity response from {model_name} (Elapsed: {elapsed}s)...")
 
+    # Fallback chain — Pro tiers first, Flash variants LAST.
+    # Code-generation callers should pass blocked_models=BUILD_BLOCKED_MODELS
+    # to remove every Flash variant entirely (per user mandate: never fall
+    # back to Flash/Flash-Lite for code work — Customtools is the cap).
     fallbacks = [
         config.GEMINI_MODEL_31_CUSTOMTOOLS,
         config.GEMINI_MODEL_31_PRO,
+        config.GEMINI_MODEL_25_PRO,
         config.GEMINI_MODEL_31_FLASH_LITE,
         config.GEMINI_MODEL_31_FLASH,
         config.GEMINI_MODEL_30_FLASH,
-        config.GEMINI_MODEL_25_PRO,
-        config.GEMINI_MODEL_25_FLASH
+        config.GEMINI_MODEL_25_FLASH,
     ]
 
     # Model execution with fallbacks (unique items)
@@ -333,7 +423,7 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
                         if response.candidates and response.candidates[0].content.parts:
                             for part in response.candidates[0].content.parts:
                                 if hasattr(part, 'function_call') and part.function_call:
-                                    return {"text": f"Task completed via tool call: {part.function_call.name}", "thought_signature": thought_signature}
+                                    raise ValueError(f"Response from {model} returned only a function_call ({part.function_call.name}) with no text content — trying next model.")
 
                         raise ValueError(f"Response from {model} has no usable content.")
 
@@ -413,11 +503,41 @@ async def call_llm_async(model_name: str, prompt: str, system_instruction: str =
     except Exception as e:
         return {"text": f"Error: All LLM paths failed. {str(e)}", "thought_signature": None}
 
-def call_llm(model_name: str, prompt: str, system_instruction: str = "", persona_name: str = "Integrity Monitor", history: list = None, attachments: list = None) -> dict:
-    """Consolidated LLM entry point (blocking wrapper)."""
+def call_llm(model_name: str, prompt: str, system_instruction: str = "", persona_name: str = "Integrity Monitor", history: list = None, attachments: list = None, blocked_models: list = None, max_tokens: int = 65536) -> dict:
+    """Consolidated LLM entry point (blocking wrapper).
+
+    Safe to call from:
+      • a worker thread spawned via loop.run_in_executor (no current loop)
+      • a synchronous script (no current loop anywhere)
+      • inside a running event loop (re-entrant via nest_asyncio)
+    """
+    coro_factory = lambda: call_llm_async(
+        model_name, prompt, system_instruction,
+        persona_name=persona_name, history=history, attachments=attachments,
+        blocked_models=blocked_models, max_tokens=max_tokens,
+    )
+
+    # Worker-thread path: no event loop present at all.  This is the common
+    # case when called from RepairOrchestrator via run_in_executor.  Build a
+    # fresh loop, run, and tear down — never touch the caller's main loop.
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+
+    if running is None:
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(coro_factory())
+        finally:
+            try:
+                new_loop.close()
+            except Exception:
+                pass
+
+    # Re-entrant path: caller is already inside an event loop (e.g. an async
+    # FastAPI handler that, mid-flight, invoked a sync helper).  nest_asyncio
+    # patches the running loop so run_until_complete works recursively.
     import nest_asyncio
-    nest_asyncio.apply()
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        return asyncio.run_coroutine_threadsafe(call_llm_async(model_name, prompt, system_instruction, persona_name=persona_name, history=history, attachments=attachments), loop).result()
-    return asyncio.run(call_llm_async(model_name, prompt, system_instruction, persona_name=persona_name, history=history, attachments=attachments))
+    nest_asyncio.apply(running)
+    return running.run_until_complete(coro_factory())

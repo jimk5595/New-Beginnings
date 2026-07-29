@@ -17,6 +17,7 @@ except ImportError:
 load_dotenv()
 
 from fastapi import FastAPI, APIRouter
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.routing import Mount
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
@@ -200,6 +201,14 @@ async def lifespan(app: FastAPI):
 # --- PARENT APP INSTANCE ---
 app = FastAPI(lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- DECORATOR ROUTES (PRESERVED ACROSS REFRESH) ---
 @app.get("/chat.html")
 async def get_chat():
@@ -247,7 +256,7 @@ async def get_dashboard():
                 f'                    <div class="card" onclick="window.location.href=\'{ui_link}\'" '
                 f'style="cursor:pointer; border-left: 4px solid #00f2fe;">\n'
                 f'                        <h3>{display_name}</h3>\n'
-                f'                        <p>{info.get("description", "Active module")}</p>\n'
+                f'                        <p>{(info.get("description", "Active module") or "Active module")[:100]}{"…" if len(info.get("description", "")) > 100 else ""}</p>\n'
                 f'                    </div>\n'
             )
 

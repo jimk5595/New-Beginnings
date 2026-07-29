@@ -67,8 +67,9 @@ async def extract_and_store_memory(
         )
 
         from core.llm_client import call_llm_async
+        from core.config import Config as _MemConfig
         result = await call_llm_async(
-            model_name="gemini-3.1-flash-lite-preview",
+            model_name=_MemConfig().MODEL_QWEN_PLUS,
             prompt=prompt,
             system_instruction="You are a precise memory extraction engine. Return only valid JSON.",
             persona_name="Memory Extractor",

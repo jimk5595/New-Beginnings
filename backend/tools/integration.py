@@ -86,7 +86,27 @@ def RUN_INTEGRATION_TASK(task_text: str, project_map: ProjectMap = None, module_
         built_js = root_path / "backend" / "static" / "built" / "modules" / module_name / "index.js"
         if proc.returncode != 0 or not built_js.exists():
             reason = "esbuild exited non-zero" if proc.returncode != 0 else "index.js not produced"
-            err_detail = ((proc.stdout or "") + (proc.stderr or ""))[:600].strip()
+            # Surface the REAL esbuild error, not the build banner. esbuild prints its
+            # diagnostics ("X [ERROR] ..." plus the "index.tsx:line:col:" reference) at the
+            # END of the output stream, after the start-up banner. Slicing the FIRST 3000
+            # chars captured only the banner, hiding the actual parse error from both the
+            # server logs and the downstream esbuild-error-regex repair handlers (which key
+            # on "index.tsx:<line>:<col>" and the error message text). Extract from the first
+            # error marker to the end so the diagnostic and its line:col are always included.
+            _combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            _err_idx = -1
+            for _marker in ("[ERROR]", "error:", "ERROR:"):
+                _i = _combined.find(_marker)
+                if _i != -1 and (_err_idx == -1 or _i < _err_idx):
+                    _err_idx = _i
+            if _err_idx != -1:
+                # Begin a little before the marker so the leading "X "/"✘ " glyph is kept.
+                _start = max(0, _err_idx - 4)
+                err_detail = _combined[_start:_start + 3000].strip()
+            else:
+                # No recognizable marker — fall back to the TAIL, where esbuild emits the
+                # real failure (e.g. "Unexpected end of file"), not the head banner.
+                err_detail = _combined[-3000:].strip()
             narrate("Dr. Mira Kessler", f"CRITICAL: Build failed for '{module_name}' — {reason}. Detail: {err_detail}")
             return f"ERROR: Bundle failed for {module_name} ({reason}). Detail: {err_detail}"
         narrate("Juniper Ryle", f"Build successful for {module_name}")
@@ -146,11 +166,12 @@ def RUN_INTEGRATION_TASK(task_text: str, project_map: ProjectMap = None, module_
         )
 
         manifest.setdefault("modules", {})[module_name] = {
-            "name": mod_info.get("name", module_name),
-            "description": mod_info.get("description", ""),
+            **existing,
+            "name": mod_info.get("name", existing.get("name", module_name)),
+            "description": mod_info.get("description", existing.get("description", "")),
             "path": f"backend/modules/{module_name}",
-            "entrypoint": mod_info.get("entrypoint", "app.py"),
-            "ui_link": mod_info.get("ui_link", "index.html"),
+            "entrypoint": mod_info.get("entrypoint", existing.get("entrypoint", "app.py")),
+            "ui_link": mod_info.get("ui_link", existing.get("ui_link", "index.html")),
             "status": "active",
             "personas": resolved_personas,
         }
@@ -169,9 +190,10 @@ def RUN_INTEGRATION_TASK(task_text: str, project_map: ProjectMap = None, module_
                 # Fallback: Try to hit the local refresh endpoint if the server is running
                 try:
                     import httpx
-                    # Use a short timeout so we don't hang if the server is not up
+                    import os as _os
+                    _port = _os.getenv("PORT", "8000")
                     with httpx.Client(timeout=2.0) as client:
-                        resp = client.get("http://127.0.0.1:8000/api/system/refresh")
+                        resp = client.get(f"http://127.0.0.1:{_port}/api/system/refresh")
                         if resp.status_code == 200:
                             narrate("Isaac Moreno", f"Routes live: /api/{module_name} is now mounted via API refresh.")
                         else:

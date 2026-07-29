@@ -30,7 +30,7 @@ FUNCTIONAL_CHECK_JS = """() => {
         const hasSvg = mc.querySelector('svg');
         // Don't count ErrorBoundary content or empty error divs as rendered maps
         const hasErrorUI = mc.innerHTML.includes('View Error') || mc.innerHTML.includes('View Module Error') || mc.innerHTML.includes('Cannot access');
-        const rendered = !hasErrorUI && (tiles.length > 0 || !!hasCanvas || !!hasSvg || mc.innerHTML.length > 200);
+        const rendered = !hasErrorUI && (tiles.length > 0 || !!hasCanvas || !!hasSvg);
         if (rendered) results.maps.rendered++;
         results.maps.details.push({
             index: i,
@@ -136,10 +136,18 @@ FUNCTIONAL_CHECK_JS = """() => {
         '[class*="section"], [class*="Section"], [class*="widget"], [class*="Widget"]'
     );
     results.data_sections.found = dataSections.length;
+    // Placeholder / spinner / no-value text must NOT count as real content. A card stuck
+    // on "Loading…", "Awaiting…", "Acquiring…", "--", "N/A", or "0" is empty to the user
+    // even though innerText.length > 10 (the card LABEL alone exceeds that). Strip the
+    // known placeholder tokens; if nothing substantive remains, the section is empty.
+    const PLACEHOLDER_RE = /(loading|awaiting|acquiring|please wait|fetching|calculating|synthesiz|initializing|no data|unavailable|--|—|n\/a)/i;
     dataSections.forEach((ds, i) => {
         if (i >= 40) return;
         const text = (ds.innerText || '').trim();
-        const hasContent = text.length > 10;
+        // Remove digits/punctuation/placeholder words to see if any real value words remain.
+        const stripped = text.replace(PLACEHOLDER_RE, ' ').replace(/[\s\-—:.,%°]+/g, ' ').trim();
+        const isPlaceholder = PLACEHOLDER_RE.test(text) && stripped.length < 4;
+        const hasContent = text.length > 10 && !isPlaceholder;
         if (hasContent) {
             results.data_sections.with_content++;
         } else {
@@ -198,7 +206,12 @@ PER_VIEW_TEST_JS = r"""async () => {
         '[class*="menu-item"], [class*="MenuItem"], [class*="nav-item"], [class*="NavItem"], ' +
         'header a, header button, [class*="navItem"], [class*="sidebarItem"]'
     );
-    const items = Array.from(navItems).filter(el => el.offsetHeight > 0 && el.offsetWidth > 0).slice(0, 20);
+    const items = Array.from(navItems).filter(el => {
+        if (el.offsetHeight <= 0 || el.offsetWidth <= 0) return false;
+        const label = (el.getAttribute('aria-label') || el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+        if (!label || label === '\n' || label.toLowerCase().includes('toggle sidebar') || label.toLowerCase().includes('earthintel') || label.toLowerCase().includes('brand')) return false;
+        return true;
+    }).slice(0, 20);
 
     function checkReactHandlers(el) {
         const rp = Object.keys(el).find(k => k.startsWith('__reactProps'));
@@ -457,15 +470,34 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
 
     pw = None
     browser = None
+    context = None
     try:
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(headless=True)
-        page = await browser.new_page()
+        context = await browser.new_context(
+            geolocation={"latitude": 39.8283, "longitude": -98.5795},
+            permissions=["geolocation"],
+        )
+        page = await context.new_page()
 
         console_errors = []
         api_404s = []
         api_500s = []
         api_422s = []
+        # Request-lifecycle tracking to catch HANGING / SLOW /api/ requests. A data route
+        # that embeds a blocking 15-90s LLM call never returns within the render-check
+        # window, so its fetch is still in-flight when we inspect the page — the exact
+        # cause of permanent 'Loading…' spinners. Status-code checks (404/500/422) cannot
+        # see this because no response ever arrives. We record start times on request,
+        # completion on requestfinished/requestfailed, and at the end flag any /api/
+        # request that never completed (pending) or took longer than SLOW_API_THRESHOLD_S.
+        import time as _time
+        api_req_start = {}     # request object -> monotonic start time
+        api_req_done = {}      # path -> duration seconds (finished)
+        api_req_failed = {}    # path -> failure text
+
+        def _api_path(url):
+            return url.split('/api/', 1)[-1] if '/api/' in url else url
 
         def _on_console(msg):
             if msg.type in ("error", "warning"):
@@ -473,6 +505,24 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
 
         def _on_page_error(error):
             console_errors.append(f"[uncaught] {error.message if hasattr(error, 'message') else str(error)}")
+
+        def _on_request(request):
+            if '/api/' in request.url:
+                api_req_start[request] = _time.monotonic()
+
+        def _on_request_finished(request):
+            if request in api_req_start:
+                api_req_done[_api_path(request.url)] = _time.monotonic() - api_req_start.pop(request)
+
+        def _on_request_failed(request):
+            if request in api_req_start:
+                api_req_start.pop(request, None)
+                ft = ""
+                try:
+                    ft = request.failure or ""
+                except Exception:
+                    pass
+                api_req_failed[_api_path(request.url)] = ft
 
         def _on_response(response):
             if '/api/' in response.url:
@@ -489,6 +539,9 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
 
         page.on("console", _on_console)
         page.on("pageerror", _on_page_error)
+        page.on("request", _on_request)
+        page.on("requestfinished", _on_request_finished)
+        page.on("requestfailed", _on_request_failed)
         page.on("response", _on_response)
 
         try:
@@ -499,7 +552,22 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
             narrate("Dr. Mira Kessler", f"Render check FAILED: could not load page — {nav_err}")
             return result
 
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(2000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=14000)
+        except Exception:
+            pass
+        try:
+            await page.wait_for_function(
+                "() => { "
+                "  const spinners = document.querySelectorAll('[class*=\"loading\"], [class*=\"Loading\"], [class*=\"spinner\"], [class*=\"Spinner\"]'); "
+                "  return spinners.length === 0 || Array.from(spinners).every(s => s.offsetHeight === 0 || window.getComputedStyle(s).display === 'none'); "
+                "}",
+                timeout=3000
+            )
+        except Exception:
+            pass
+        await page.wait_for_timeout(1000)
 
         root_info = await page.evaluate("""() => {
             const root = document.getElementById('root');
@@ -581,10 +649,16 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
                 )
 
             data = func_results.get("data_sections", {})
-            if data.get("found", 0) > 5 and data.get("with_content", 0) == 0:
+            _ds_found = data.get("found", 0)
+            _ds_with_content = data.get("with_content", 0)
+            if _ds_found > 3 and _ds_with_content < max(1, _ds_found // 4):
+                _ds_empty_pct = int(100 * (1 - _ds_with_content / _ds_found))
+                _ds_empty_examples = data.get("empty", [])[:4]
                 functional_failures.append(
-                    f"DATA SECTIONS: {data['found']} card/panel/section elements found but ALL are empty. "
-                    f"No data is being displayed. Likely: API calls failing or data not rendered."
+                    f"DATA SECTIONS: {_ds_found} card/panel/section elements found but {_ds_empty_pct}% are empty "
+                    f"({_ds_with_content} have content). No meaningful data is being displayed. "
+                    f"Empty sections: {', '.join(str(e) for e in _ds_empty_examples)}. "
+                    f"Likely: API calls failing, wrong field names, or data not bound to JSX."
                 )
 
             imgs = func_results.get("images", {})
@@ -702,6 +776,60 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
                 "Check the backend @router.get signature for the required parameter names."
             )
 
+        # HANGING / SLOW /api/ REQUEST DETECTION: the single biggest cause of permanently
+        # stuck pages is a data route that blocks on a 15-90s LLM call (or any slow upstream)
+        # and never returns within the page-load window. Such a request is still in-flight
+        # (present in api_req_start, never moved to api_req_done) when we finish inspecting,
+        # or it eventually finished but took far longer than a page-load fetch should.
+        _SLOW_API_THRESHOLD_S = 6.0
+        _pending = sorted({_api_path(req.url) for req in list(api_req_start.keys())})
+        if _pending:
+            result["api_pending"] = _pending
+            functional_failures.append(
+                f"API HANG: {len(_pending)} backend route(s) never responded within the page-load "
+                f"window — the fetch is still pending, so the view is stuck on 'Loading…'/'Awaiting…' "
+                f"FOREVER: " + ", ".join(f"/{p}" for p in _pending[:8]) + ". The route handler is "
+                "blocking (most commonly an `await _safe_call_llm(...)`/`call_llm_async(...)` LLM call "
+                "embedded in a data/GET route). Remove ALL LLM calls from page-load data routes — the "
+                "LLM is an on-demand tool that belongs ONLY in /ai/... button routes."
+            )
+        _slow = sorted(p for p, d in api_req_done.items() if d > _SLOW_API_THRESHOLD_S)
+        if _slow:
+            result["api_slow"] = _slow
+            functional_failures.append(
+                f"API SLOW: {len(_slow)} backend route(s) took >{_SLOW_API_THRESHOLD_S:.0f}s to respond — "
+                f"the view shows a long spinner before any data appears: "
+                + ", ".join(f"/{p} ({api_req_done[p]:.0f}s)" for p in _slow[:8])
+                + ". A page-load data route must respond in well under a second; move any LLM/heavy "
+                "work to an on-demand /ai/... button route."
+            )
+
+        # STUCK-VIEW DETECTION: after all waits + nav clicks, if the visible page text is still
+        # dominated by a loading/awaiting/acquiring placeholder, the primary data fetch never
+        # resolved. This catches full-view spinner overlays ("Loading Space Weather Intelligence…",
+        # "Acquiring Deep Sky Imagery…", "Loading marine data…") that the old check counted as
+        # rendered content because the spinner text alone exceeded the length threshold.
+        try:
+            _stuck = await page.evaluate("""() => {
+                const root = document.getElementById('root') || document.body;
+                const t = (root.innerText || '');
+                const re = /(loading|awaiting|acquiring|please wait|fetching|synthesiz)/i;
+                const hits = (t.match(new RegExp(re, 'gi')) || []);
+                // Stuck if placeholder words are present AND the page is otherwise sparse.
+                return { hit: hits.length > 0, count: hits.length, len: t.length,
+                         sample: (t.match(re) ? t.substr(Math.max(0, t.search(re)-10), 60) : '') };
+            }""")
+            if _stuck.get("hit") and _stuck.get("len", 0) < 1200:
+                result["stuck_view"] = _stuck
+                functional_failures.append(
+                    f"STUCK VIEW: the page is still showing a loading/awaiting placeholder after "
+                    f"full load + interaction (\"{_stuck.get('sample','').strip()}\") with little other "
+                    f"content (only {_stuck.get('len',0)} chars). The primary data fetch never resolved — "
+                    "almost always a blocking LLM call in a data route. Data routes must return immediately."
+                )
+        except Exception:
+            pass
+
         result["functional_failures"] = functional_failures
 
         if functional_failures:
@@ -721,6 +849,11 @@ async def check_module_renders(module_name: str, port: int = 8000, timeout_ms: i
         result["error_summary"] = f"Render check exception: {e}"
         narrate("Dr. Mira Kessler", f"Render check ERROR: {e}")
     finally:
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
         if browser:
             try:
                 await browser.close()
